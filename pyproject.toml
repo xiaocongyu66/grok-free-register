@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "slow: 压力测试(较慢)",
+    "needs_network: 需要外部网络",
+]

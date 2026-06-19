@@ -27,9 +27,10 @@ if [ ! -f .env ] || [ "${1:-}" = "--reconfig" ]; then
 EMAIL_MODE=custom
 EMAIL_DOMAIN=${domain}
 EMAIL_API=${api}
-# 资源上限(可选,留空=自动)
-# MAX_SLOTS=
-# CPU_TARGET=85
+# CSP 容量(可选,0=按 CPU/内存启动期静态派生)
+# PHYSICAL_CAP=0
+# PHYSICAL_PER_CPU=2
+# PHYSICAL_MEM_MB=512
 # MIN_FREE_MEM_MB=500
 ENV
         echo ""

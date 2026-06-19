@@ -1,9 +1,11 @@
 """
-Grok Free Register — 自适应状态机版
+Grok Free Register — CSP 异步并发架构
 =============================================
-单进程 asyncio + 单共享 CloakBrowser + 中央状态机调度器:
-  - Scheduler 按 token/验证码缓冲缺口动态分配 SOLVE/PRODUCE/CONSUME
-  - load_governor 采样实时 CPU 利用率,自适应伸缩并发(对核数自动放大)
+单进程 asyncio + 单共享 CloakBrowser + Semaphore 背压:
+  - S_Worker: 生成 Turnstile token (T)
+  - P_Worker: 创建邮箱 + 发送验证码 + 轮询验证码 (Q)
+  - C_Worker: claim pair 并执行注册
+  - Semaphore 背压控制容量,无需中心调度器
 
 两种邮箱模式(EMAIL_MODE):
   - tempmail (默认,零配置): 免费临时邮箱,多 provider 自动 fallback
@@ -26,6 +28,12 @@ from urllib.parse import quote
 from playwright.async_api import async_playwright
 from concurrent.futures import ThreadPoolExecutor
 
+# CSP 架构组件
+from core.admission import AdmissionGate
+from core.envelope import ResourceEnvelope
+from core.inventory import Inventory
+from core.observer import Metrics
+
 os.makedirs("keys", exist_ok=True)
 SITE_URL = "https://accounts.x.ai"
 
@@ -36,17 +44,48 @@ def _env_int(key, default):
     except ValueError:
         return default
 
+def _env_int_or_none(key):
+    raw = str(os.environ.get(key, "")).strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
 EMAIL_MODE      = (os.environ.get("EMAIL_MODE") or "tempmail").strip().lower()   # tempmail | custom
 if EMAIL_MODE == "mailtm":      # 兼容旧名
     EMAIL_MODE = "tempmail"
 LOCAL_EMAIL_API = (os.environ.get("EMAIL_API") or "http://127.0.0.1:8080").strip()
 EMAIL_DOMAIN    = (os.environ.get("EMAIL_DOMAIN") or "").strip()
-CPU_TARGET      = _env_int("CPU_TARGET", 85)         # 调速器目标 CPU 利用率 %
-MIN_FREE_MEM_MB = _env_int("MIN_FREE_MEM_MB", 500)   # 可用内存下限(MB),低于则收缩并发
+MIN_FREE_MEM_MB = _env_int("MIN_FREE_MEM_MB", 500)   # 自动容量派生时保留的内存(MB)
 T_TARGET        = _env_int("T_TARGET", 4)            # token 池缓冲目标
 Q_TARGET        = _env_int("Q_TARGET", 4)            # 就绪验证码缓冲目标
 TARGET          = _env_int("TARGET", 0)              # 攒够 N 个号自动停(0=不限;--target N 可覆盖)
-_MAX_SLOTS_ENV  = (os.environ.get("MAX_SLOTS") or "").strip()  # 空=自动 cpu*4
+
+# CSP 容量参数
+PHYSICAL_CAP    = _env_int("PHYSICAL_CAP", 0)        # 本地物理资源许可,0=自动派生
+PHYSICAL_PER_CPU = _env_int("PHYSICAL_PER_CPU", 2)   # 自动派生 CPU 侧保守上限;压测可临时覆盖
+PHYSICAL_MEM_MB = _env_int("PHYSICAL_MEM_MB", 512)   # 每个物理许可的保守内存预算(MB)
+CAPACITY_PROFILE = (os.environ.get("CAPACITY_PROFILE") or "").strip()
+T_SLOT_CAP      = _env_int("T_SLOT_CAP", 8)          # token 库存缓冲
+Q_SLOT_CAP      = _env_int("Q_SLOT_CAP", 8)          # 验证码库存缓冲
+Q_PENDING_CAP   = _env_int("Q_PENDING_CAP", 12)       # 外部在途 Q 请求上限
+T_MAX_AGE       = _env_int("T_MAX_AGE", 300)          # token 最大年龄(秒)
+Q_MAX_AGE       = _env_int("Q_MAX_AGE", 120)          # 验证码最大年龄(秒)
+P_REQUEST_TIMEOUT = _env_int("P_REQUEST_TIMEOUT", 95) # P 等待 Q 返回超时(秒)
+C_CONSUME_TIMEOUT = _env_int("C_CONSUME_TIMEOUT", 60) # C 消费完整 pair 超时(秒)
+S_WORKERS       = _env_int("S_WORKERS", 0)            # 0=自动
+P_WORKERS       = _env_int("P_WORKERS", 0)
+C_WORKERS       = _env_int("C_WORKERS", 0)
+
+# CSP v2 局部门控/批量发送参数。水位默认在启动期结合 Physical_Sem 派生。
+_T_HIGH_WATER_OVERRIDE = _env_int_or_none("T_HIGH_WATER")
+_T_LOW_WATER_OVERRIDE  = _env_int_or_none("T_LOW_WATER")
+_Q_HIGH_WATER_OVERRIDE = _env_int_or_none("Q_HIGH_WATER")
+_Q_LOW_WATER_OVERRIDE  = _env_int_or_none("Q_LOW_WATER")
+P_BATCH_MAX     = max(1, _env_int("P_BATCH_MAX", 4))
+P_SEND_CAP      = _env_int("P_SEND_CAP", 0)           # >0=显式限制并发 P 发送页面;0=不额外建模
 
 SITE_KEY = None
 ACTION_ID = None
@@ -75,7 +114,7 @@ def decode_jwt_payload(token):
     if len(parts) < 2: return None
     payload = parts[1] + '=' * (4 - len(parts[1]) % 4)
     try: return json.loads(base64.urlsafe_b64decode(payload))
-    except: return None
+    except Exception: return None
 def find_chrome():
     paths = glob.glob(os.path.expanduser("~/.cloakbrowser/chromium-*/chrome"))
     if not paths: raise RuntimeError("CloakBrowser not found")
@@ -97,7 +136,7 @@ def get_system_resources(max_mem_arg=None):
                 break
         else:
             total, available = 4096, 2048
-    except:
+    except Exception:
         total, available = 4096, 2048
 
     if max_mem_arg:
@@ -113,6 +152,117 @@ def get_system_resources(max_mem_arg=None):
         max_mem = available
 
     return {'cpu': cpu_count, 'total_mem': total, 'available_mem': available, 'max_mem': max_mem}
+
+
+def load_capacity_profile(path=CAPACITY_PROFILE):
+    """读取离线校准生成的设备 profile。不存在或无效时返回空配置。"""
+    if not path:
+        return {}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    profile = {}
+    try:
+        physical_cap = int(data.get("physical_cap", 0))
+    except (TypeError, ValueError):
+        physical_cap = 0
+    if physical_cap > 0:
+        profile["physical_cap"] = physical_cap
+    return profile
+
+
+def derive_capacity(
+    cpu_count,
+    max_mem_mb,
+    *,
+    physical_cap=None,
+    profile_physical_cap=None,
+    physical_per_cpu=None,
+    physical_mem_mb=None,
+    min_free_mem_mb=None,
+):
+    """启动期静态容量派生:显式配置 > 设备 profile > CPU/内存保守自动值。"""
+    configured_physical = PHYSICAL_CAP if physical_cap is None else physical_cap
+    profiled_physical = profile_physical_cap or 0
+    per_cpu = PHYSICAL_PER_CPU if physical_per_cpu is None else physical_per_cpu
+    mem_per_physical = PHYSICAL_MEM_MB if physical_mem_mb is None else physical_mem_mb
+    reserve_mem = MIN_FREE_MEM_MB if min_free_mem_mb is None else min_free_mem_mb
+
+    cpu_cap = max(1, cpu_count * max(1, per_cpu))
+    usable_mem = max(0, max_mem_mb - reserve_mem)
+    mem_cap = max(1, usable_mem // max(1, mem_per_physical))
+    auto_cap = max(1, min(cpu_cap, mem_cap))
+
+    if configured_physical > 0:
+        physical = configured_physical
+    elif profiled_physical > 0:
+        physical = max(1, min(profiled_physical, mem_cap))
+    else:
+        physical = auto_cap
+
+    s_workers = S_WORKERS if S_WORKERS > 0 else physical + 2
+    p_workers = P_WORKERS if P_WORKERS > 0 else Q_PENDING_CAP + 2
+    c_workers = C_WORKERS if C_WORKERS > 0 else physical + 2
+    return physical, s_workers, p_workers, c_workers
+
+
+def derive_admission_watermarks(
+    physical_cap,
+    *,
+    t_slot_cap=None,
+    q_pending_cap=None,
+    t_target=None,
+    q_target=None,
+    t_high_override=None,
+    t_low_override=None,
+    q_high_override=None,
+    q_low_override=None,
+):
+    """派生 CSP v2 局部门控水位。
+
+    T 的默认高水位跟随 Physical_Sem,避免物理并发提高后仍只允许少量 T
+    in-progress。显式环境变量覆盖仍然优先。
+    """
+    t_slot = T_SLOT_CAP if t_slot_cap is None else t_slot_cap
+    q_pending = Q_PENDING_CAP if q_pending_cap is None else q_pending_cap
+    t_goal = T_TARGET if t_target is None else t_target
+    q_goal = Q_TARGET if q_target is None else q_target
+
+    t_high_cfg = _T_HIGH_WATER_OVERRIDE if t_high_override is None else t_high_override
+    t_low_cfg = _T_LOW_WATER_OVERRIDE if t_low_override is None else t_low_override
+    q_high_cfg = _Q_HIGH_WATER_OVERRIDE if q_high_override is None else q_high_override
+    q_low_cfg = _Q_LOW_WATER_OVERRIDE if q_low_override is None else q_low_override
+
+    if t_high_cfg is None:
+        t_high = min(max(1, t_slot), max(1, t_goal, physical_cap))
+    else:
+        t_high = max(1, min(max(1, t_slot), t_high_cfg))
+
+    if t_low_cfg is None:
+        t_low = max(0, min(t_high, t_high // 2))
+    else:
+        t_low = max(0, min(t_high, t_low_cfg))
+
+    if q_high_cfg is None:
+        q_high = max(1, q_pending)
+    else:
+        q_high = max(1, min(max(1, q_pending), q_high_cfg))
+
+    if q_low_cfg is None:
+        q_low = max(0, min(q_high, q_goal, q_high // 2))
+    else:
+        q_low = max(0, min(q_high, q_low_cfg))
+
+    return {
+        "t_low": t_low,
+        "t_high": t_high,
+        "q_low": q_low,
+        "q_high": q_high,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -149,7 +299,10 @@ async def fetch_config():
                     if not any(kw in js for kw in ['createUser','registerUser','emailValidation']): continue
                     hexes = re.findall(r'[a-fA-F0-9]{40,50}', js)
                     if hexes: ACTION_ID = hexes[0]; break
-                except: continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue
             if ACTION_ID: log(f'[+] ACTION_ID: {ACTION_ID}')
         finally:
             await browser.close()
@@ -199,6 +352,8 @@ async def server_action_register(page, email, password, code, turnstile_token):
     # 首方导航访问该 URL,浏览器正常落 sso cookie(跨域 fetch 会被 CORS/三方cookie 拦)
     try:
         await page.goto(url, timeout=15000, wait_until='domcontentloaded')
+    except asyncio.CancelledError:
+        raise
     except Exception:
         pass
     cookies = await page.context.cookies()
@@ -209,7 +364,10 @@ async def server_action_register(page, email, password, code, turnstile_token):
 SOLVER_REUSE = (os.environ.get("SOLVER_REUSE", "1").strip().lower() not in ("0", "false", "no"))
 _solver_pool = []
 _solver_lock = asyncio.Lock()
-MAX_SOLVER_REUSE = 25
+MAX_SOLVER_REUSE = _env_int("MAX_SOLVER_REUSE", 25)
+SOLVER_INITIAL_WAIT_MS = _env_int("SOLVER_INITIAL_WAIT_MS", 1500)
+SOLVER_POLL_INTERVAL_MS = _env_int("SOLVER_POLL_INTERVAL_MS", 500)
+SOLVER_POLL_ATTEMPTS = _env_int("SOLVER_POLL_ATTEMPTS", 100)
 
 async def _get_solver_page(browser):
     if SOLVER_REUSE:
@@ -243,26 +401,38 @@ async def solve_one_turnstile(browser):
     try:
         # 注入 widget;turnstile 脚本已加载(复用页面)则直接 render,否则先加载脚本
         await p.evaluate(f"""var d=document.createElement('div');d.className='cf-turnstile';d.setAttribute('data-sitekey','{SITE_KEY}');d.style.cssText='position:fixed;top:10px;left:10px;z-index:99999;background:white;padding:12px;border:2px solid red;border-radius:6px;width:300px;height:70px';document.body.appendChild(d);function __r(){{window.turnstile&&window.turnstile.render(d,{{sitekey:'{SITE_KEY}',callback:function(t){{var i=document.querySelector('input[name="cf-turnstile-response"]');if(!i){{i=document.createElement('input');i.type='hidden';i.name='cf-turnstile-response';document.body.appendChild(i);}}i.value=t;}}}})}}if(window.turnstile){{__r()}}else{{var s=document.createElement('script');s.src='https://challenges.cloudflare.com/turnstile/v0/api.js';s.onload=function(){{setTimeout(__r,1000)}};document.head.appendChild(s);}}""")
-        await p.wait_for_timeout(2000)
+        await p.wait_for_timeout(SOLVER_INITIAL_WAIT_MS)
         for sel in ["iframe[src*='challenges.cloudflare.com']","iframe[src*='turnstile']",".cf-turnstile iframe"]:
             try:
                 fr = p.frame_locator(sel).first
                 await fr.locator("#checkbox, .checkbox, input[type=checkbox], body").first.click(timeout=3000)
                 break
-            except: continue
-        for i in range(50):
-            await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+        for i in range(SOLVER_POLL_ATTEMPTS):
+            await asyncio.sleep(max(50, SOLVER_POLL_INTERVAL_MS) / 1000)
             try:
                 t = await p.evaluate('document.querySelector("input[name=\\"cf-turnstile-response\\"]")?.value||""')
                 if t and len(t) > 10:
                     ok = True
                     return t
-            except: pass
-            if i > 0 and i % 10 == 0:
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            retry_every = max(1, int(10000 / max(50, SOLVER_POLL_INTERVAL_MS)))
+            if i > 0 and i % retry_every == 0:
                 try: await p.locator(".cf-turnstile").first.click(timeout=1000)
-                except: pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
         return None
-    except:
+    except asyncio.CancelledError:
+        raise
+    except Exception:
         return None
     finally:
         await _put_solver_page(item, ok)
@@ -376,226 +546,395 @@ def poll_code(handle, max_wait=90):
     return None
 
 
-# ──────────────────────────────────────────────
-#  自适应状态机调度器
-# ──────────────────────────────────────────────
-class Scheduler:
-    """持有流水线实时状态,决定每个工作单元此刻该解 token / 发码 / 注册,
-    并按 CPU 负载动态伸缩并发(target_slots)。"""
-    def __init__(self, token_pool, ready_queue, cpu):
-        self.tokens = token_pool
-        self.ready = ready_queue
-        self.cpu = cpu
-        # MAX_SLOTS 留空=自动 cpu*4;否则用用户配置(下限 2)
-        self.max_slots = max(2, int(_MAX_SLOTS_ENV)) if _MAX_SLOTS_ENV.isdigit() else max(4, cpu * 4)
-        self.target_slots = min(self.max_slots, max(2, cpu))
-        self.active = 0
-        self.codes_sent = 0
-        self.codes_got = 0
-        self.bg = set()
+async def _create_email_async(loop):
+    """在线程池中创建邮箱,避免阻塞 asyncio 事件循环。"""
+    return await loop.run_in_executor(POLL_EXECUTOR, create_email)
 
-    def pick_role(self):
-        T, Q = self.tokens.qsize(), self.ready.qsize()
-        if T == 0 and Q > 0:   return SOLVE      # consumer 缺 token,最高优先
-        if Q > 0 and T > 0:    return CONSUME    # 两路就绪 → 出号
-        if T < T_TARGET:       return SOLVE      # 补 token 缓冲
-        if Q < Q_TARGET:       return PRODUCE    # 补验证码
-        return IDLE                              # 缓冲都满,歇着
 
-    async def gate(self):
-        # active < target_slots 之间无 await,asyncio 单线程下不会交错,放行原子
-        while self.active >= self.target_slots:
-            await asyncio.sleep(0.15)
-        self.active += 1
+async def _poll_code_async(loop, handle):
+    """在线程池中轮询验证码。"""
+    return await loop.run_in_executor(POLL_EXECUTOR, poll_code, handle)
+
+
+async def _acquire_many(sem, count):
+    """一次预留多个许可；取消或异常时回滚已获取许可。"""
+    acquired = 0
+    try:
+        for _ in range(count):
+            await sem.acquire()
+            acquired += 1
+        return acquired
+    except BaseException:
+        for _ in range(acquired):
+            sem.release()
+        raise
+
+
+class _NoopAsyncSemaphore:
+    async def acquire(self):
+        return True
 
     def release(self):
-        if self.active > 0:
-            self.active -= 1
-
-    def spawn_bg(self, coro):
-        t = asyncio.create_task(coro)
-        self.bg.add(t)
-        t.add_done_callback(self.bg.discard)
+        return None
 
 
-async def poll_and_enqueue(sched, sent):
-    """异步轮询验证码并入队(不占并发名额,阻塞轮询跑在线程池里)。"""
-    loop = asyncio.get_event_loop()
-    futs = [(it, loop.run_in_executor(POLL_EXECUTOR, poll_code, it['jwt'])) for it in sent]
-    for it, fut in futs:
-        try:
-            code = await asyncio.wait_for(fut, timeout=95)
-        except asyncio.TimeoutError:
-            log(f'[P] {it["email"]} poll timeout'); continue
-        if code:
-            sched.codes_got += 1
-            await sched.ready.put({'email': it['email'], 'password': it['password'], 'code': code})
-            log(f'[P] {it["email"]} code={code} q:{sched.ready.qsize()}')
-        else:
-            log(f'[P] {it["email"]} no code')
+async def _send_q_request_batch(browser, physical_sem, p_send_sem, requests):
+    """使用一个页面发送一批 Q 请求。
 
-
-async def produce_codes(browser, sched):
-    """补足就绪队列:按缺口创建邮箱,单个长驻 page 连发 gRPC,轮询另起后台任务。"""
-    loop = asyncio.get_event_loop()
-    need = min(5, Q_TARGET - sched.ready.qsize())
-    if need <= 0:
-        return
-    batch = []
-    for _ in range(need):
-        try:
-            jwt, email, password = await loop.run_in_executor(POLL_EXECUTOR, create_email)
-            batch.append({'jwt': jwt, 'email': email, 'password': password})
-        except Exception:
-            pass
-    if not batch:
-        return
-    sent = []
-    page = await browser.new_page()
+    返回每个请求的 sent 状态。等待 Q 返回不在此函数内发生,因此这里释放
+    Physical_Sem 后不会占用本地重资源。
+    """
+    p_send_acquired = False
+    physical_acquired = False
+    page = None
+    await p_send_sem.acquire()
+    p_send_acquired = True
     try:
+        await physical_sem.acquire()
+        physical_acquired = True
+        page = await browser.new_page()
         await page.set_viewport_size({"width": 800, "height": 600})
-        await page.goto(f'{SITE_URL}/sign-up?redirect=grok-com', timeout=30000)
-        await page.wait_for_timeout(1500)
-        for item in batch:
+        try:
+            await page.goto(f'{SITE_URL}/sign-up?redirect=grok-com', timeout=30000)
+            await page.wait_for_timeout(1500)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return [{**item, "sent": False} for item in requests]
+
+        results = []
+        for item in requests:
+            sent = False
             try:
-                if await grpc_create_code(page, item['email']):
-                    sched.codes_sent += 1
-                    sent.append(item)
-                    log(f'[P] {item["email"]} code sent')
+                sent = await grpc_create_code(page, item["email"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                sent = False
+            results.append({**item, "sent": sent})
+        return results
+    finally:
+        if page is not None:
+            try:
+                await page.close()
             except Exception:
                 pass
-            await asyncio.sleep(1)
+        if physical_acquired:
+            physical_sem.release()
+        if p_send_acquired:
+            p_send_sem.release()
+
+
+async def _poll_and_admit_q(
+    request,
+    inventory,
+    q_pending_sem,
+    q_slot_sem,
+    metrics,
+    *,
+    q_batch_lease=None,
+    admission_gate=None,
+):
+    """等待单个 Q 返回并入库；每个请求独立释放 pending/inflight。"""
+    loop = asyncio.get_event_loop()
+    terminal = False
+    try:
+        try:
+            code = await asyncio.wait_for(
+                _poll_code_async(loop, request["handle"]),
+                timeout=P_REQUEST_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            code = None
+            terminal = True
+
+        if code is None:
+            terminal = True
+            metrics.q_discarded += 1
+            return False
+
+        terminal = True
+        metrics.q_returned += 1
+        returned_at = time.time()
+        q_env = None
+        try:
+            q_env = await ResourceEnvelope.create_with_slot(
+                'Q',
+                {
+                    'email': request["email"],
+                    'password': request["password"],
+                    'code': code,
+                },
+                q_slot_sem,
+                expires_at=returned_at + Q_MAX_AGE,
+            )
+            await inventory.put_q(q_env)
+            log(f'[P] {request["email"]} code={code} admitted')
+            return True
+        except asyncio.CancelledError:
+            if q_env is not None and not q_env.released:
+                q_env.discard()
+            raise
+        except Exception:
+            if q_env is not None and not q_env.released:
+                q_env.discard()
+            metrics.q_discarded += 1
+            terminal = True
+            return False
     finally:
-        try: await page.close()
-        except Exception: pass
-    if sent:
-        sched.spawn_bg(poll_and_enqueue(sched, sent))
+        if terminal:
+            q_pending_sem.release()
+            if q_batch_lease is not None:
+                await q_batch_lease.release_one()
+            if admission_gate is not None:
+                await admission_gate.notify_changed()
 
 
-async def consume_one(browser, sched):
-    """取 1 token + 1 就绪项完成注册;取不全则放回,不丢单。"""
+def _observe_background_task(task):
+    """Consume detached task failures so background settlement is not silent."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log(f'[P] background settle err: {str(e)[:60]}')
+
+
+# ──────────────────────────────────────────────
+#  CSP Worker
+# ──────────────────────────────────────────────
+
+async def s_worker(wid, browser, inventory, physical_sem, t_slot_sem, metrics, admission_gate=None):
+    """S_Worker: 生成 T 并入库。"""
+    while not STOP.is_set():
+        t_lease = None
+        try:
+            if admission_gate is not None:
+                t_lease = await admission_gate.acquire_t_production()
+
+            await physical_sem.acquire()
+            token = None
+            solve_started = time.time()
+            try:
+                token = await solve_one_turnstile(browser)
+            finally:
+                solve_elapsed = time.time() - solve_started
+                metrics.t_solve_count += 1
+                metrics.t_solve_seconds += solve_elapsed
+                if token is None:
+                    metrics.t_solve_failed += 1
+                physical_sem.release()
+
+            if token is None:
+                metrics.t_discarded += 1
+                await asyncio.sleep(0.5)
+                continue
+
+            metrics.t_produced += 1
+            now = time.time()
+            t_env = None
+            try:
+                t_env = await ResourceEnvelope.create_with_slot(
+                    'T', token, t_slot_sem, expires_at=now + T_MAX_AGE
+                )
+                await inventory.put_t(t_env)
+                if admission_gate is not None:
+                    await admission_gate.notify_changed()
+            except asyncio.CancelledError:
+                if t_env is not None and not t_env.released:
+                    t_env.discard()
+                metrics.t_discarded += 1
+                raise
+            except Exception:
+                if t_env is not None and not t_env.released:
+                    t_env.discard()
+                metrics.t_discarded += 1
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if t_lease is not None:
+                await t_lease.release()
+        await asyncio.sleep(0.2)
+
+
+async def p_worker(
+    wid,
+    browser,
+    inventory,
+    physical_sem,
+    q_pending_sem,
+    q_slot_sem,
+    metrics,
+    admission_gate=None,
+    p_send_sem=None,
+    max_batch=1,
+):
+    """P_Worker: 创建邮箱 + 发码 + 轮询 + 入库。"""
+    loop = asyncio.get_event_loop()
+    p_send_sem = p_send_sem or _NoopAsyncSemaphore()
+    while not STOP.is_set():
+        q_lease = None
+        pending_owned = 0
+        settle_tasks = []
+        try:
+            if admission_gate is not None:
+                q_lease = await admission_gate.acquire_q_batch(max_batch=max_batch)
+                batch_count = q_lease.count
+            else:
+                batch_count = 1
+
+            pending_owned = await _acquire_many(q_pending_sem, batch_count)
+
+            requests = []
+            for _ in range(batch_count):
+                try:
+                    handle, email, password = await _create_email_async(loop)
+                    requests.append({"handle": handle, "email": email, "password": password})
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log(f'[P] {wid} create email err: {str(e)[:60]}')
+                    metrics.q_discarded += 1
+                    q_pending_sem.release()
+                    pending_owned -= 1
+                    if q_lease is not None:
+                        await q_lease.release_one()
+
+            if not requests:
+                continue
+
+            results = await _send_q_request_batch(
+                browser, physical_sem, p_send_sem, requests
+            )
+            metrics.q_send_batches += 1
+            metrics.q_send_batch_items += len(results)
+
+            for item in results:
+                if not item["sent"]:
+                    metrics.q_discarded += 1
+                    q_pending_sem.release()
+                    pending_owned -= 1
+                    if q_lease is not None:
+                        await q_lease.release_one()
+                    continue
+
+                metrics.q_sent += 1
+                pending_owned -= 1
+                task = asyncio.create_task(
+                    _poll_and_admit_q(
+                        item,
+                        inventory,
+                        q_pending_sem,
+                        q_slot_sem,
+                        metrics,
+                        q_batch_lease=q_lease,
+                        admission_gate=admission_gate,
+                    )
+                )
+                task.add_done_callback(_observe_background_task)
+                settle_tasks.append(task)
+
+            if settle_tasks:
+                await asyncio.gather(*(asyncio.shield(task) for task in settle_tasks))
+
+        except asyncio.CancelledError:
+            for _ in range(pending_owned):
+                q_pending_sem.release()
+                if q_lease is not None:
+                    await q_lease.release_one()
+            raise
+        except Exception as e:
+            log(f'[P] {wid} err: {str(e)[:60]}')
+            metrics.q_discarded += 1
+            for _ in range(pending_owned):
+                q_pending_sem.release()
+                if q_lease is not None:
+                    await q_lease.release_one()
+        await asyncio.sleep(0.2)
+
+
+async def _consume_pair(browser, physical_sem, pair, metrics):
+    """执行一次 C 消费。返回 True 表示业务成功,False 表示消费失败。"""
     global success_count
-    try:
-        tok_item = sched.tokens.get_nowait()
-    except asyncio.QueueEmpty:
-        return
-    try:
-        item = sched.ready.get_nowait()
-    except asyncio.QueueEmpty:
-        try: sched.tokens.put_nowait(tok_item)
-        except asyncio.QueueFull: pass
-        return
-    email, password, code = item['email'], item['password'], item['code']
-    token = tok_item['token']
+    email = pair.q.value['email']
+    password = pair.q.value['password']
+    code = pair.q.value['code']
+    token = pair.t.value
+
+    await physical_sem.acquire()
     t0 = time.time()
     try:
         page = await browser.new_page()
         await page.set_viewport_size({"width": 800, "height": 600})
-        await page.goto(f'{SITE_URL}/sign-up?redirect=grok-com', timeout=30000)
-        await page.wait_for_timeout(1500)
-        sso = None
-        if await grpc_verify_code(page, email, code):
-            sso = await server_action_register(page, email, password, code, token)
-        try: await page.close()
-        except Exception: pass
+        try:
+            await page.goto(f'{SITE_URL}/sign-up?redirect=grok-com', timeout=30000)
+            await page.wait_for_timeout(1500)
+            sso = None
+            if await grpc_verify_code(page, email, code):
+                sso = await server_action_register(page, email, password, code, token)
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
         if sso:
             elapsed = time.time() - t0
             async with file_lock:
-                with open("keys/grok.txt", "a") as f: f.write(sso + "\n")
-                with open("keys/accounts.txt", "a") as f: f.write(f"{email}:{password}:{sso}\n")
-                success_count += 1
-                count = success_count
-            avg = (time.time() - start_time) / count
+                with open("keys/grok.txt", "a") as f:
+                    f.write(sso + "\n")
+                with open("keys/accounts.txt", "a") as f:
+                    f.write(f"{email}:{password}:{sso}\n")
+                metrics.success_count += 1
+                success_count = metrics.success_count
+                count = metrics.success_count
+            avg = (time.time() - metrics.start_time) / count
             log(f'[✓] {email} {elapsed:.1f}s avg:{avg:.1f}s #{count}')
-    except Exception as e:
-        log(f'[C] Error: {str(e)[:60]}')
+            return True
+
+        log(f'[✗] {email} register failed')
+        return False
+    finally:
+        physical_sem.release()
 
 
-async def worker(wid, browser, sched):
-    """通用工作单元:循环向调度器要角色并执行,并发由 gate 控制。"""
+async def c_worker(wid, browser, inventory, physical_sem, metrics, admission_gate=None):
+    """C_Worker: claim pair 并执行注册。"""
     while not STOP.is_set():
-        role = sched.pick_role()
-        if role == IDLE:
-            await asyncio.sleep(0.5)
-            continue
-        await sched.gate()
         try:
-            if role == SOLVE:
-                token = await solve_one_turnstile(browser)
-                if token:
-                    try: sched.tokens.put_nowait({'token': token, 'time': time.time()})
-                    except asyncio.QueueFull: pass
-            elif role == PRODUCE:
-                await produce_codes(browser, sched)
-            elif role == CONSUME:
-                await consume_one(browser, sched)
+            async with inventory.claim_pair() as pair:
+                if admission_gate is not None:
+                    await admission_gate.notify_changed()
+                try:
+                    ok = await asyncio.wait_for(
+                        _consume_pair(browser, physical_sem, pair, metrics),
+                        timeout=C_CONSUME_TIMEOUT,
+                    )
+                    if ok:
+                        metrics.pair_consumed_ok += 1
+                    else:
+                        metrics.pair_consumed_fail += 1
+                except asyncio.TimeoutError:
+                    metrics.pair_consumed_fail += 1
+                    log(f'[C] {wid} consume timeout after {C_CONSUME_TIMEOUT}s')
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            log(f'[W{wid}] {role} err: {str(e)[:60]}')
-        finally:
-            sched.release()
-        await asyncio.sleep(0.3)
+            log(f'[C] {wid} err: {str(e)[:60]}')
+            metrics.pair_consumed_fail += 1
+        await asyncio.sleep(0.2)
 
 
 # ──────────────────────────────────────────────
-#  负载控制器（按实时 CPU 利用率自适应伸缩 + 监控）
+#  只读监控
 # ──────────────────────────────────────────────
-def _cpu_times():
-    with open('/proc/stat') as f:
-        nums = list(map(int, f.readline().split()[1:]))
-    idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
-    return sum(nums), idle
-
-def _free_mem_mb():
-    """可用内存(MB);读不到返回很大值表示不限。"""
-    try:
-        with open('/proc/meminfo') as f:
-            for line in f:
-                if line.startswith('MemAvailable:'):
-                    return int(line.split()[1]) // 1024
-    except Exception:
-        pass
-    return 1 << 30
-
-async def load_governor(sched):
-    try:
-        prev = _cpu_times()
-    except Exception:
-        prev = None
-    cpu_avg = float(CPU_TARGET)  # EMA 平滑后的 CPU 值,避免单次采样抖动
+async def monitor(inventory, sems, metrics, interval=8):
+    """定期输出系统状态。"""
     while not STOP.is_set():
-        await asyncio.sleep(4)
-        cpu_pct = float(CPU_TARGET)
-        try:
-            cur = _cpu_times()
-            if prev:
-                dt, di = cur[0] - prev[0], cur[1] - prev[1]
-                if dt > 0: cpu_pct = 100.0 * (1 - di / dt)
-            prev = cur
-        except Exception:
-            pass
-        # EMA:0.3 权重给新值,0.7 保留历史,平滑浏览器突发型负载的 4%↔100% 跳变
-        cpu_avg = 0.3 * cpu_pct + 0.7 * cpu_avg
-
-        free_mb = _free_mem_mb()
-        starving = sched.tokens.qsize() < T_TARGET or sched.ready.qsize() < Q_TARGET
-        # 内存护栏优先:可用内存低于下限就收缩。
-        # 收缩阈值:EMA > 目标+10%;扩张阈值:EMA < 目标-10%。宽窗口防振荡。
-        if free_mb < MIN_FREE_MEM_MB and sched.target_slots > 2:
-            sched.target_slots -= 1
-        elif cpu_avg > CPU_TARGET + 10 and sched.target_slots > 2:
-            sched.target_slots -= 1
-        elif (cpu_avg < CPU_TARGET - 10 and starving
-              and free_mb > MIN_FREE_MEM_MB and sched.target_slots < sched.max_slots):
-            sched.target_slots += 1
-
-        elapsed = time.time() - start_time
-        rate = success_count / (elapsed / 60) if elapsed > 60 else 0
-        hit = (sched.codes_got / sched.codes_sent * 100) if sched.codes_sent else 0
-        log(f'[*] slots:{sched.target_slots}/{sched.max_slots} act:{sched.active} '
-            f'cpu:{cpu_pct:.0f}% avg:{cpu_avg:.0f}%/{CPU_TARGET} mem:{free_mb}M T:{sched.tokens.qsize()} Q:{sched.ready.qsize()} '
-            f'sent:{sched.codes_sent} got:{sched.codes_got}({hit:.0f}%) '
-            f'rate:{rate:.1f}/min #{success_count}')
-        if TARGET and success_count >= TARGET:
+        await asyncio.sleep(interval)
+        log(metrics.snapshot(inventory, sems))
+        if TARGET and metrics.success_count >= TARGET:
             log(f'[*] 已达目标 {TARGET} 个,停止。'); STOP.set()
 
 
@@ -613,6 +952,16 @@ async def main():
 
     resources = get_system_resources(max_mem_arg)
     cpu = resources['cpu']
+    capacity_profile = load_capacity_profile()
+
+    # 自动派生容量
+    physical_cap, s_workers, p_workers, c_workers = derive_capacity(
+        cpu,
+        resources['max_mem'],
+        profile_physical_cap=capacity_profile.get("physical_cap"),
+    )
+    p_send_cap = P_SEND_CAP if P_SEND_CAP > 0 else 0
+    admission_watermarks = derive_admission_watermarks(physical_cap)
 
     # 校验邮箱模式配置
     if EMAIL_MODE not in ('tempmail', 'custom'):
@@ -621,11 +970,22 @@ async def main():
         log("[!] custom 模式需在 .env 设置 EMAIL_DOMAIN(并运行 email_server.py)"); sys.exit(1)
 
     log("=" * 50)
-    log(f"  Grok Free Register (Adaptive Scheduler)")
+    log(f"  Grok Free Register (CSP Architecture)")
     log(f"  CPU: {cpu} cores  Memory: {resources['available_mem']}/{resources['total_mem']}MB")
+    log(f"  MaxMemForAuto: {resources['max_mem']}MB  MemReserve: {MIN_FREE_MEM_MB}MB  PhysicalMemBudget: {PHYSICAL_MEM_MB}MB")
+    if capacity_profile:
+        log(f"  CapacityProfile: {CAPACITY_PROFILE} physical_cap={capacity_profile.get('physical_cap')}")
     log(f"  EmailMode: {EMAIL_MODE}" + (f" ({EMAIL_DOMAIN})" if EMAIL_MODE == 'custom' else ""))
-    log(f"  Limits: MAX_SLOTS={_MAX_SLOTS_ENV or f'auto(cpu*4)'} CPU_TARGET={CPU_TARGET}% MIN_FREE_MEM={MIN_FREE_MEM_MB}M" +
-        (f" TARGET={TARGET}" if TARGET else ""))
+    log(f"  Physical_Sem={physical_cap}  T_Slot={T_SLOT_CAP}  Q_Slot={Q_SLOT_CAP}  Q_Pending={Q_PENDING_CAP}")
+    log(
+        f"  Admission: T_LOW/HIGH={admission_watermarks['t_low']}/{admission_watermarks['t_high']}  "
+        f"Q_LOW/HIGH={admission_watermarks['q_low']}/{admission_watermarks['q_high']}"
+    )
+    log(f"  P_BatchMax={P_BATCH_MAX}  P_Send_Sem={'disabled' if p_send_cap == 0 else p_send_cap}")
+    log(f"  Workers: S={s_workers} P={p_workers} C={c_workers}")
+    log(f"  Timeouts: P_Request={P_REQUEST_TIMEOUT}s  C_Consume={C_CONSUME_TIMEOUT}s")
+    if TARGET:
+        log(f"  Target: {TARGET}")
     log("=" * 50)
 
     await fetch_config()
@@ -634,14 +994,67 @@ async def main():
         browser = await pw.chromium.launch(executable_path=find_chrome(), headless=True)
         log('[*] Browser launched')
 
-        token_pool = asyncio.Queue(maxsize=20)
-        ready_queue = asyncio.Queue(maxsize=50)
-        sched = Scheduler(token_pool, ready_queue, cpu)
+        # CSP 组件
+        metrics = Metrics()
+        inventory = Inventory(metrics=metrics)
+        admission_gate = AdmissionGate(
+            inventory,
+            t_low=admission_watermarks["t_low"],
+            t_high=admission_watermarks["t_high"],
+            q_low=admission_watermarks["q_low"],
+            q_high=admission_watermarks["q_high"],
+        )
+        physical_sem = asyncio.Semaphore(physical_cap)
+        p_send_sem = asyncio.Semaphore(p_send_cap) if p_send_cap > 0 else None
+        t_slot_sem = asyncio.Semaphore(T_SLOT_CAP)
+        q_slot_sem = asyncio.Semaphore(Q_SLOT_CAP)
+        q_pending_sem = asyncio.Semaphore(Q_PENDING_CAP)
 
-        tasks = [asyncio.create_task(load_governor(sched))]
-        for i in range(sched.max_slots):
-            tasks.append(asyncio.create_task(worker(i, browser, sched)))
-        log(f'[*] Scheduler up: {sched.max_slots} workers, target {sched.target_slots} slots (cpu={cpu})')
+        sems = {
+            'physical': physical_sem,
+            't_slot': t_slot_sem,
+            'q_slot': q_slot_sem,
+            'q_pending': q_pending_sem,
+            'admission': admission_gate,
+        }
+        if p_send_sem is not None:
+            sems['p_send'] = p_send_sem
+
+        tasks = []
+
+        # S_Workers
+        for i in range(s_workers):
+            tasks.append(asyncio.create_task(
+                s_worker(i, browser, inventory, physical_sem, t_slot_sem, metrics, admission_gate)
+            ))
+
+        # P_Workers
+        for i in range(p_workers):
+            tasks.append(asyncio.create_task(
+                p_worker(
+                    i,
+                    browser,
+                    inventory,
+                    physical_sem,
+                    q_pending_sem,
+                    q_slot_sem,
+                    metrics,
+                    admission_gate,
+                    p_send_sem,
+                    P_BATCH_MAX,
+                )
+            ))
+
+        # C_Workers
+        for i in range(c_workers):
+            tasks.append(asyncio.create_task(
+                c_worker(i, browser, inventory, physical_sem, metrics, admission_gate)
+            ))
+
+        # Monitor
+        tasks.append(asyncio.create_task(monitor(inventory, sems, metrics)))
+
+        log(f'[*] CSP up: S={s_workers} P={p_workers} C={c_workers} workers')
 
         try:
             await asyncio.gather(*tasks)

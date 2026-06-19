@@ -6,3 +6,6 @@ keys/
 *.bak
 .venv/
 .DS_Store
+.claude/
+test_results/
+test_results_real/
