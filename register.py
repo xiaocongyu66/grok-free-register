@@ -78,6 +78,14 @@ C_CONSUME_TIMEOUT = _env_int("C_CONSUME_TIMEOUT", 60) # C 消费完整 pair 超�
 S_WORKERS       = _env_int("S_WORKERS", 0)            # 0=自动
 P_WORKERS       = _env_int("P_WORKERS", 0)
 C_WORKERS       = _env_int("C_WORKERS", 0)
+C_HOT_PAGE_POOL = (os.environ.get("C_HOT_PAGE_POOL", "0").strip().lower() in ("1", "true", "yes"))
+C_HOT_PAGE_POOL_SIZE = _env_int("C_HOT_PAGE_POOL_SIZE", 0)
+C_SET_COOKIE_VIA_REQUEST = (
+    os.environ.get("C_SET_COOKIE_VIA_REQUEST", "1" if C_HOT_PAGE_POOL else "0")
+    .strip()
+    .lower()
+    in ("1", "true", "yes")
+)
 
 # CSP v2 局部门控/批量发送参数。水位默认在启动期结合 Physical_Sem 派生。
 _T_HIGH_WATER_OVERRIDE = _env_int_or_none("T_HIGH_WATER")
@@ -267,6 +275,14 @@ def derive_admission_watermarks(
     }
 
 
+def derive_c_hot_page_pool_size(physical_cap, c_workers, configured_size=None):
+    """启动期静态派生 C 热页池容量；显式配置优先。"""
+    configured = C_HOT_PAGE_POOL_SIZE if configured_size is None else configured_size
+    if configured and configured > 0:
+        return configured
+    return max(1, min(max(1, physical_cap), max(1, c_workers)))
+
+
 # ──────────────────────────────────────────────
 #  配置获取
 # ──────────────────────────────────────────────
@@ -359,6 +375,18 @@ async def server_action_register(page, email, password, code, turnstile_token):
     if not m:
         return None
     url = m.group(1)
+    if C_SET_COOKIE_VIA_REQUEST:
+        try:
+            await page.context.request.get(url, timeout=15000)
+            cookies = await page.context.cookies()
+            sso = next((c['value'] for c in cookies if c['name'] == 'sso'), None)
+            if sso:
+                return sso
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
     # 首方导航访问该 URL,浏览器正常落 sso cookie(跨域 fetch 会被 CORS/三方cookie 拦)
     try:
         await page.goto(url, timeout=15000, wait_until='domcontentloaded')
@@ -803,6 +831,106 @@ def _observe_background_task(task):
 #  CSP Worker
 # ──────────────────────────────────────────────
 
+class _CHotPageLease:
+    def __init__(self, browser):
+        self.browser = browser
+        self.context = None
+        self.page = None
+
+    async def __aenter__(self):
+        self.context, self.page = await _acquire_c_page(self.browser)
+        return self.page
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await _release_c_page(self.context, self.page, healthy=exc_type is None)
+        self.context = None
+        self.page = None
+        return False
+
+
+_c_hot_page_pool = []
+_c_hot_page_lock = asyncio.Lock()
+_c_hot_page_pool_size = derive_c_hot_page_pool_size(PHYSICAL_CAP or 1, C_WORKERS or 1)
+
+
+async def _new_c_hot_page(browser):
+    context = await browser.new_context()
+    page = await context.new_page()
+    await page.set_viewport_size({"width": 800, "height": 600})
+    await _prepare_signup_page(page, redirect=True, timeout=30000)
+    return context, page
+
+
+async def _acquire_c_page(browser):
+    if C_HOT_PAGE_POOL:
+        async with _c_hot_page_lock:
+            if _c_hot_page_pool:
+                return _c_hot_page_pool.pop()
+        return await _new_c_hot_page(browser)
+
+    page = await browser.new_page()
+    await page.set_viewport_size({"width": 800, "height": 600})
+    await _prepare_signup_page(page, redirect=True, timeout=30000)
+    return None, page
+
+
+async def _release_c_page(context, page, *, healthy):
+    if not C_HOT_PAGE_POOL or context is None:
+        try:
+            await page.close()
+        except Exception:
+            pass
+        return
+
+    if healthy:
+        try:
+            if "/sign-up" not in (getattr(page, "url", "") or ""):
+                healthy = False
+            else:
+                await context.clear_cookies()
+                await page.evaluate(
+                    "() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) {} }"
+                )
+                async with _c_hot_page_lock:
+                    if len(_c_hot_page_pool) < _c_hot_page_pool_size:
+                        _c_hot_page_pool.append((context, page))
+                        return
+        except asyncio.CancelledError:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            raise
+        except Exception:
+            pass
+
+    try:
+        await context.close()
+    except Exception:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+def _c_page_lease(browser):
+    return _CHotPageLease(browser)
+
+
+async def _close_c_hot_page_pool():
+    async with _c_hot_page_lock:
+        items = list(_c_hot_page_pool)
+        _c_hot_page_pool.clear()
+    for context, page in items:
+        try:
+            await context.close()
+        except Exception:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+
 async def s_worker(wid, browser, inventory, physical_sem, t_slot_sem, metrics, admission_gate=None):
     """S_Worker: 生成 T 并入库。"""
     while not STOP.is_set():
@@ -961,18 +1089,10 @@ async def _consume_pair(browser, physical_sem, pair, metrics):
     await physical_sem.acquire()
     t0 = time.time()
     try:
-        page = await browser.new_page()
-        await page.set_viewport_size({"width": 800, "height": 600})
-        try:
-            await _prepare_signup_page(page, redirect=True, timeout=30000)
+        async with _c_page_lease(browser) as page:
             sso = None
             if await grpc_verify_code(page, email, code):
                 sso = await server_action_register(page, email, password, code, token)
-        finally:
-            try:
-                await page.close()
-            except Exception:
-                pass
 
         if sso:
             elapsed = time.time() - t0
@@ -1038,7 +1158,7 @@ async def monitor(inventory, sems, metrics, interval=8):
 #  主入口
 # ──────────────────────────────────────────────
 async def main():
-    global TARGET
+    global TARGET, _c_hot_page_pool_size
     max_mem_arg = None
     for i, arg in enumerate(sys.argv[1:], 1):
         if arg == '--max-mem' and i + 1 < len(sys.argv):
@@ -1058,6 +1178,7 @@ async def main():
     )
     p_send_cap = P_SEND_CAP if P_SEND_CAP > 0 else 0
     admission_watermarks = derive_admission_watermarks(physical_cap)
+    _c_hot_page_pool_size = derive_c_hot_page_pool_size(physical_cap, c_workers)
 
     # 校验邮箱模式配置
     if EMAIL_MODE not in ('tempmail', 'custom'):
@@ -1078,6 +1199,11 @@ async def main():
         f"Q_LOW/HIGH={admission_watermarks['q_low']}/{admission_watermarks['q_high']}"
     )
     log(f"  P_BatchMax={P_BATCH_MAX}  P_Send_Sem={'disabled' if p_send_cap == 0 else p_send_cap}")
+    log(
+        f"  C_HotPagePool={'on' if C_HOT_PAGE_POOL else 'off'}"
+        f" size={_c_hot_page_pool_size if C_HOT_PAGE_POOL else 0}"
+        f" setCookieViaRequest={'on' if C_SET_COOKIE_VIA_REQUEST else 'off'}"
+    )
     log(f"  Workers: S={s_workers} P={p_workers} C={c_workers}")
     log(f"  Timeouts: P_Request={P_REQUEST_TIMEOUT}s  C_Consume={C_CONSUME_TIMEOUT}s")
     if TARGET:
@@ -1159,6 +1285,7 @@ async def main():
         finally:
             for t in tasks:
                 t.cancel()
+            await _close_c_hot_page_pool()
             await browser.close()
 
 if __name__ == "__main__":

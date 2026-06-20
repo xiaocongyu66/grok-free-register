@@ -23,16 +23,20 @@ import register
 
 
 class FakePage:
-    def __init__(self):
+    def __init__(self, context=None):
+        self.context = context
         self.closed = False
+        self.url = "about:blank"
         self.goto_calls = []
         self.waits = []
+        self.evaluations = []
 
     async def set_viewport_size(self, size):
         self.viewport = size
         pass
 
     async def goto(self, url, timeout=None, wait_until=None):
+        self.url = url
         self.goto_calls.append({
             "url": url,
             "timeout": timeout,
@@ -44,20 +48,65 @@ class FakePage:
         self.waits.append(timeout)
         pass
 
+    async def evaluate(self, script):
+        self.evaluations.append(script)
+        return None
+
     async def close(self):
         self.closed = True
         pass
 
 
+class FakeContext:
+    def __init__(self):
+        self.pages = []
+        self.closed = False
+        self.clear_cookies_calls = 0
+        self.request = types.SimpleNamespace(get=self._request_get)
+        self.request_get_calls = []
+        self.cookies_value = []
+        self.cancel_on_clear = False
+
+    async def new_page(self):
+        page = FakePage(self)
+        self.pages.append(page)
+        return page
+
+    async def clear_cookies(self):
+        self.clear_cookies_calls += 1
+        if self.cancel_on_clear:
+            raise asyncio.CancelledError()
+        self.cookies_value = []
+        pass
+
+    async def cookies(self):
+        return list(self.cookies_value)
+
+    async def _request_get(self, url, timeout=None):
+        self.request_get_calls.append({"url": url, "timeout": timeout})
+        return types.SimpleNamespace(status=403)
+
+    async def close(self):
+        self.closed = True
+        for page in self.pages:
+            page.closed = True
+
+
 class FakeBrowser:
     def __init__(self):
         self.pages = []
+        self.contexts = []
         self.context = types.SimpleNamespace(request=object())
 
     async def new_page(self):
-        page = FakePage()
+        page = FakePage(self.context)
         self.pages.append(page)
         return page
+
+    async def new_context(self):
+        context = FakeContext()
+        self.contexts.append(context)
+        return context
 
 
 class FakePair:
@@ -102,8 +151,13 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self._old_poll_code_async = register._poll_code_async
         self._old_log = register.log
         self._old_target = register.TARGET
+        self._old_c_hot_page_pool = getattr(register, "C_HOT_PAGE_POOL", None)
+        self._old_c_hot_page_pool_size = getattr(register, "C_HOT_PAGE_POOL_SIZE", None)
+        self._old_c_set_cookie_via_request = getattr(register, "C_SET_COOKIE_VIA_REQUEST", None)
 
     async def asyncTearDown(self):
+        if hasattr(register, "_close_c_hot_page_pool"):
+            await register._close_c_hot_page_pool()
         register.STOP = self._old_stop
         if self._old_timeout is not None:
             register.C_CONSUME_TIMEOUT = self._old_timeout
@@ -114,6 +168,18 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         register._poll_code_async = self._old_poll_code_async
         register.log = self._old_log
         register.TARGET = self._old_target
+        if self._old_c_hot_page_pool is None and hasattr(register, "C_HOT_PAGE_POOL"):
+            delattr(register, "C_HOT_PAGE_POOL")
+        elif self._old_c_hot_page_pool is not None:
+            register.C_HOT_PAGE_POOL = self._old_c_hot_page_pool
+        if self._old_c_hot_page_pool_size is None and hasattr(register, "C_HOT_PAGE_POOL_SIZE"):
+            delattr(register, "C_HOT_PAGE_POOL_SIZE")
+        elif self._old_c_hot_page_pool_size is not None:
+            register.C_HOT_PAGE_POOL_SIZE = self._old_c_hot_page_pool_size
+        if self._old_c_set_cookie_via_request is None and hasattr(register, "C_SET_COOKIE_VIA_REQUEST"):
+            delattr(register, "C_SET_COOKIE_VIA_REQUEST")
+        elif self._old_c_set_cookie_via_request is not None:
+            register.C_SET_COOKIE_VIA_REQUEST = self._old_c_set_cookie_via_request
 
     async def test_c_worker_timeout_releases_physical_and_pair_and_counts_failure(self):
         async def slow_verify(*_args, **_kwargs):
@@ -140,6 +206,133 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(physical_sem._value, 1)
         self.assertEqual(inventory.active, 0)
         self.assertEqual(metrics.pair_consumed_fail, 1)
+
+    async def test_c_consume_uses_single_use_page_by_default(self):
+        async def ok_verify(*_args, **_kwargs):
+            return True
+
+        async def no_sso_register(*_args, **_kwargs):
+            return None
+
+        register.C_HOT_PAGE_POOL = False
+        register.grpc_verify_code = ok_verify
+        register.server_action_register = no_sso_register
+        register.log = lambda _msg: None
+
+        browser = FakeBrowser()
+        physical_sem = asyncio.Semaphore(1)
+
+        ok = await register._consume_pair(browser, physical_sem, FakePair(), Metrics())
+
+        self.assertFalse(ok)
+        self.assertEqual(len(browser.pages), 1)
+        self.assertEqual(len(browser.contexts), 0)
+        self.assertTrue(browser.pages[0].closed)
+        self.assertEqual(physical_sem._value, 1)
+
+    async def test_c_hot_page_reuses_page_and_clears_cookies_between_consumes(self):
+        seen_pages = []
+
+        async def ok_verify(*_args, **_kwargs):
+            return True
+
+        async def no_sso_register(page, *_args, **_kwargs):
+            seen_pages.append(page)
+            return None
+
+        register.C_HOT_PAGE_POOL = True
+        register.C_HOT_PAGE_POOL_SIZE = 2
+        register.grpc_verify_code = ok_verify
+        register.server_action_register = no_sso_register
+        register.log = lambda _msg: None
+
+        browser = FakeBrowser()
+        physical_sem = asyncio.Semaphore(1)
+
+        first = await register._consume_pair(browser, physical_sem, FakePair(), Metrics())
+        second = await register._consume_pair(browser, physical_sem, FakePair(), Metrics())
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(len(browser.contexts), 1)
+        self.assertEqual(len(browser.contexts[0].pages), 1)
+        self.assertEqual(seen_pages, [browser.contexts[0].pages[0], browser.contexts[0].pages[0]])
+        self.assertEqual(browser.contexts[0].clear_cookies_calls, 2)
+        self.assertFalse(browser.contexts[0].closed)
+        self.assertFalse(browser.contexts[0].pages[0].closed)
+        self.assertEqual(physical_sem._value, 1)
+
+    async def test_c_hot_page_discards_page_after_exception(self):
+        async def failing_verify(*_args, **_kwargs):
+            raise RuntimeError("verify failed")
+
+        register.C_HOT_PAGE_POOL = True
+        register.C_HOT_PAGE_POOL_SIZE = 2
+        register.grpc_verify_code = failing_verify
+        register.log = lambda _msg: None
+
+        browser = FakeBrowser()
+        physical_sem = asyncio.Semaphore(1)
+
+        with self.assertRaises(RuntimeError):
+            await register._consume_pair(browser, physical_sem, FakePair(), Metrics())
+
+        self.assertEqual(len(browser.contexts), 1)
+        self.assertTrue(browser.contexts[0].closed)
+        self.assertTrue(browser.contexts[0].pages[0].closed)
+        self.assertEqual(physical_sem._value, 1)
+
+    async def test_c_hot_page_closes_context_when_cancelled_during_cleanup(self):
+        context = FakeContext()
+        page = await context.new_page()
+        page.url = "https://accounts.x.ai/sign-up?redirect=grok-com"
+        context.cancel_on_clear = True
+        register.C_HOT_PAGE_POOL = True
+
+        with self.assertRaises(asyncio.CancelledError):
+            await register._release_c_page(context, page, healthy=True)
+
+        self.assertTrue(context.closed)
+        self.assertTrue(page.closed)
+
+    async def test_c_hot_page_discards_page_after_fallback_navigation(self):
+        context = FakeContext()
+        page = await context.new_page()
+        page.url = "https://example.test/set-cookie?q=abc"
+        register.C_HOT_PAGE_POOL = True
+        register.C_HOT_PAGE_POOL_SIZE = 2
+
+        await register._release_c_page(context, page, healthy=True)
+
+        self.assertTrue(context.closed)
+        self.assertTrue(page.closed)
+        self.assertEqual(register._c_hot_page_pool, [])
+
+    async def test_server_action_can_set_cookie_via_request_without_navigating_page(self):
+        page = FakePage()
+        context = FakeContext()
+        context.cookies_value = [{"name": "sso", "value": "x" * 152}]
+        page.context = context
+        page.goto_calls = []
+
+        async def fake_evaluate(_script):
+            return '0:"https:\\/\\/auth.grokipedia.com\\/set-cookie?q=abc"1:'
+
+        page.evaluate = fake_evaluate
+        register.STATE_TREE = "state"
+        register.ACTION_ID = "action"
+        register.C_SET_COOKIE_VIA_REQUEST = True
+
+        sso = await register.server_action_register(
+            page, "e@example.test", "pw", "123456", "token"
+        )
+
+        self.assertEqual(sso, "x" * 152)
+        self.assertEqual(page.goto_calls, [])
+        self.assertEqual(
+            context.request_get_calls,
+            [{"url": "https://auth.grokipedia.com/set-cookie?q=abc", "timeout": 15000}],
+        )
 
     async def test_monitor_uses_metrics_snapshot(self):
         register.STOP = asyncio.Event()
@@ -285,6 +478,26 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(watermarks["t_high"], 4)
         self.assertEqual(watermarks["t_low"], 2)
+
+    async def test_c_hot_page_pool_size_is_derived_at_startup(self):
+        self.assertEqual(
+            register.derive_c_hot_page_pool_size(
+                physical_cap=6, c_workers=8, configured_size=0
+            ),
+            6,
+        )
+        self.assertEqual(
+            register.derive_c_hot_page_pool_size(
+                physical_cap=8, c_workers=3, configured_size=0
+            ),
+            3,
+        )
+        self.assertEqual(
+            register.derive_c_hot_page_pool_size(
+                physical_cap=8, c_workers=10, configured_size=4
+            ),
+            4,
+        )
 
     async def test_send_q_request_batch_reuses_one_page_for_multiple_emails(self):
         emails = []

@@ -102,6 +102,8 @@ EMAIL_API=http://127.0.0.1:8080
 | `SOLVER_FAST_CLICK` | `1` | 没有可见验证框时跳过慢点击 |
 | `PAGE_GOTO_WAIT_UNTIL` | `domcontentloaded` | 注册页面导航等待条件 |
 | `PAGE_POST_WAIT_MS` | `500` | 页面导航后的短等待时间 |
+| `C_HOT_PAGE_POOL` | `0` | 可选性能模式，复用消费阶段页面以提升速度 |
+| `C_HOT_PAGE_POOL_SIZE` | `0` | 热页池容量，`0` 表示按启动期并发自动派生 |
 
 不确定怎么调时，先保持默认值。需要压测时，优先观察 `PHYSICAL_CAP`，不要先改 Worker 数量。
 
