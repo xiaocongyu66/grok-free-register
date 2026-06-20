@@ -200,4 +200,11 @@ python3 run_tests.py
 
 这些优化只改变单个 worker 内部的固定步骤耗时，不引入中心调度器、不改变 `Inventory` 所有权语义，也不在运行时动态调整容量。
 
+可选性能路径：
+
+- `C_HOT_PAGE_POOL=1`：`C_Worker` 可以复用停在注册页的隔离页面 context，并在每次消费后清理 cookies、localStorage 和 sessionStorage。
+- `C_SET_COOKIE_VIA_REQUEST=1`：注册成功后用浏览器 context 的 request 访问 set-cookie URL，避免把热页导航离开注册页；如果没有拿到 `sso`，仍回退到原导航路径。
+
+这个优化仍然发生在单个 `C_Worker` 的 pair lease 内，不改变 `Inventory` 配对语义，也不引入中心调度。真实 10 分钟 A/B 中，关闭热页池时吞吐约 `15.5/min`、C 消费平均耗时约 `7.5s`、浏览器 RSS 峰值约 `4.0GB`；开启热页池后，样本吞吐约 `22/min`、C 消费平均耗时约 `2.2s`。本测试服务器的运行 profile 采用 `C_HOT_PAGE_POOL=1`、`C_HOT_PAGE_POOL_SIZE=3`、`C_SET_COOKIE_VIA_REQUEST=1`；这只是该服务器的静态 profile，不是通用最优参数。通用仓库默认仍保持关闭，池大小需要按机器内存做压测或使用启动期派生值。
+
 以下实验方向不属于默认路径：请求后端替代页面后端、等待 `T` 时保留更多活页面、更高默认物理并发。它们只能作为单独压测项处理。
