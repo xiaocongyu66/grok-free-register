@@ -9,3 +9,7 @@ keys/
 .claude/
 test_results/
 test_results_real/
+docs/developer-handoff.md
+docs/experiments/
+docs/research/
+tmp_*.py

@@ -156,7 +156,6 @@ setup.sh                    安装依赖
 runtime_log_analyzer.py     运行日志分析工具
 tests/                      自动化测试
 docs/architecture.md        并发架构说明
-docs/developer-handoff.md   后续开发交接
 ```
 
 ## 测试
@@ -184,8 +183,7 @@ python3 run_tests.py --list
 
 ## 开发文档
 
-- [docs/architecture.md](docs/architecture.md)：CSP 并发模型、资源生命周期和必须保持的不变量。
-- [docs/developer-handoff.md](docs/developer-handoff.md)：当前性能优化、已验证失败的方向和后续探索建议。
+[docs/architecture.md](docs/architecture.md) 记录并发模型、资源生命周期和必须保持的不变量。
 
 ## License
 

@@ -7,6 +7,7 @@ runtime state; it only turns production logs into comparable stage rates.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from typing import Iterable
 
@@ -24,6 +25,8 @@ _STATE_RE = re.compile(
     r"sent:(?P<q_sent>\d+) got:(?P<q_ret>\d+)\((?P<q_hit>[0-9.]+)%\) "
     r"rate:(?P<rate>[0-9.]+)/min #(?P<ok>\d+)"
 )
+
+_SOLVER_TIMELINE_PREFIX = "[solver_timeline] "
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,11 @@ class MonitorRow:
         if self.ok <= 0 or self.rate <= 0:
             return None
         return self.ok / self.rate
+
+
+@dataclass(frozen=True)
+class SolverTimeline:
+    events: list[dict]
 
 
 def _int_field(rest: str, name: str) -> int | None:
@@ -210,6 +218,18 @@ def _leader(values: dict[str, float | None]) -> str | None:
     return max(values, key=lambda key: values[key] or 0)
 
 
+def _avg(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 2)
+
+
+def _ratio(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round(numerator / denominator, 3)
+
+
 def summarize_monitor_rows(rows: list[MonitorRow], recent_count: int = 6) -> dict[str, float | int | str | None]:
     if not rows:
         return {"rows": 0}
@@ -278,6 +298,121 @@ def summarize_monitor_rows(rows: list[MonitorRow], recent_count: int = 6) -> dic
         "recent_pair_per_min": _rate_delta(recent, "pair"),
     }
     return summary
+
+
+def parse_solver_timelines(text_or_lines: str | Iterable[str]) -> list[SolverTimeline]:
+    if isinstance(text_or_lines, str):
+        lines = text_or_lines.splitlines()
+    else:
+        lines = list(text_or_lines)
+
+    timelines: list[SolverTimeline] = []
+    for line in lines:
+        if not line.startswith(_SOLVER_TIMELINE_PREFIX):
+            continue
+        payload = line[len(_SOLVER_TIMELINE_PREFIX):]
+        try:
+            events = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(events, list):
+            timelines.append(SolverTimeline(events=[e for e in events if isinstance(e, dict)]))
+    return timelines
+
+
+def _last_page_trace(events: list[dict]) -> dict | None:
+    for event in reversed(events):
+        page_trace = event.get("page_trace")
+        if isinstance(page_trace, dict):
+            return page_trace
+    return None
+
+
+def summarize_solver_timelines(timelines: list[SolverTimeline]) -> dict[str, float | int | None]:
+    if not timelines:
+        return {"solver_timeline_count": 0}
+
+    ok_count = 0
+    click_calls: list[float] = []
+    click_move_ms: list[float] = []
+    click_down_up_ms: list[float] = []
+    render_to_token_ms: list[float] = []
+    token_write_to_poll_done_ms: list[float] = []
+    poll_attempts: list[float] = []
+    poll_read_avg_ms: list[float] = []
+    click_before_count = 0
+    center_iframe_hits = 0
+    turnstile_iframe_seen = 0
+    widget_seen = 0
+
+    for timeline in timelines:
+        events = timeline.events
+        page_trace = _last_page_trace(events)
+        if page_trace:
+            render_called = page_trace.get("render_called_at")
+            token_written = page_trace.get("token_written_at")
+            if isinstance(render_called, (int, float)) and isinstance(token_written, (int, float)):
+                render_to_token_ms.append(float(token_written) - float(render_called))
+
+        for event in events:
+            if event.get("event") == "click_before":
+                click_before_count += 1
+                dom = event.get("dom") if isinstance(event.get("dom"), dict) else {}
+                widget = dom.get("widget") if isinstance(dom.get("widget"), dict) else {}
+                center = dom.get("element_at_center") if isinstance(dom.get("element_at_center"), dict) else {}
+                if widget.get("present") and widget.get("visible"):
+                    widget_seen += 1
+                if center.get("is_iframe"):
+                    center_iframe_hits += 1
+                if (dom.get("turnstile_iframe_count") or 0) > 0:
+                    turnstile_iframe_seen += 1
+
+            if event.get("event") == "click_after":
+                call_ms = event.get("click_call_ms")
+                if isinstance(call_ms, (int, float)):
+                    click_calls.append(float(call_ms))
+                trace = event.get("click_trace") if isinstance(event.get("click_trace"), dict) else {}
+                move1 = trace.get("mouse_move1_ms")
+                move2 = trace.get("mouse_move2_ms")
+                down = trace.get("mouse_down_ms")
+                up = trace.get("mouse_up_ms")
+                move_total = sum(float(v) for v in (move1, move2) if isinstance(v, (int, float)))
+                down_up_total = sum(float(v) for v in (down, up) if isinstance(v, (int, float)))
+                if move_total:
+                    click_move_ms.append(move_total)
+                if down_up_total:
+                    click_down_up_ms.append(down_up_total)
+
+            if event.get("event") == "poll_done":
+                if event.get("ok"):
+                    ok_count += 1
+                attempts = event.get("poll_attempts")
+                if isinstance(attempts, (int, float)):
+                    poll_attempts.append(float(attempts))
+                read_avg = event.get("poll_read_ms_avg")
+                if isinstance(read_avg, (int, float)):
+                    poll_read_avg_ms.append(float(read_avg))
+                page_trace = event.get("page_trace") if isinstance(event.get("page_trace"), dict) else {}
+                token_written = page_trace.get("token_written_at")
+                event_t = event.get("t")
+                created_at = page_trace.get("created_at")
+                if all(isinstance(v, (int, float)) for v in (token_written, event_t, created_at)):
+                    token_write_to_poll_done_ms.append((float(event_t) * 1000.0) - (float(token_written) - float(created_at)))
+
+    return {
+        "solver_timeline_count": len(timelines),
+        "ok_count": ok_count,
+        "avg_click_call_ms": _avg(click_calls),
+        "avg_click_mouse_move_ms": _avg(click_move_ms),
+        "avg_click_down_up_ms": _avg(click_down_up_ms),
+        "avg_render_to_token_ms": _avg(render_to_token_ms),
+        "avg_token_write_to_poll_done_ms": _avg(token_write_to_poll_done_ms),
+        "avg_poll_attempts": _avg(poll_attempts),
+        "avg_poll_read_ms": _avg(poll_read_avg_ms),
+        "widget_seen_ratio": _ratio(widget_seen, click_before_count),
+        "center_iframe_hit_ratio": _ratio(center_iframe_hits, click_before_count),
+        "turnstile_iframe_seen_ratio": _ratio(turnstile_iframe_seen, click_before_count),
+    }
 
 
 def analyze_text(text: str) -> dict[str, float | int | str | None]:

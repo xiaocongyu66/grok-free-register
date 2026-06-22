@@ -1,6 +1,11 @@
 import unittest
 
-from runtime_log_analyzer import parse_monitor_lines, summarize_monitor_rows
+from runtime_log_analyzer import (
+    parse_monitor_lines,
+    parse_solver_timelines,
+    summarize_monitor_rows,
+    summarize_solver_timelines,
+)
 
 
 class RuntimeLogAnalyzerTests(unittest.TestCase):
@@ -86,6 +91,41 @@ class RuntimeLogAnalyzerTests(unittest.TestCase):
         self.assertEqual(summary["last_c_register"], 1.5)
         self.assertEqual(summary["last_c_hot_hits"], 4)
         self.assertEqual(summary["last_c_hot_misses"], 1)
+
+    def test_summarizes_solver_timeline_events(self):
+        text = (
+            '[solver_timeline] [{"t":0.0,"event":"page_trace_after_inject",'
+            '"page_trace":{"created_at":0.0,"render_called_at":100.0,"render_returned_at":120.0,'
+            '"token_written_at":null}},'
+            '{"t":0.5,"event":"click_before","attempt":1,"token_len":0,'
+            '"dom":{"widget":{"present":true,"visible":true},'
+            '"turnstile_iframe_count":0,'
+            '"element_at_center":{"tag":"DIV","is_iframe":false}}},'
+            '{"t":3.0,"event":"click_after","attempt":1,"token_len":0,'
+            '"click_call_ms":2500.0,'
+            '"click_trace":{"mouse_move1_ms":500.0,"mouse_move2_ms":1500.0,'
+            '"mouse_down_ms":300.0,"mouse_up_ms":100.0}},'
+            '{"t":3.0,"event":"poll_start"},'
+            '{"t":4.0,"event":"poll_done","ok":true,"token_len":730,'
+            '"poll_attempts":2,"first_token_attempt":2,"poll_read_ms_avg":12.0,'
+            '"poll_read_ms_max":20.0,'
+            '"page_trace":{"created_at":0.0,"render_called_at":100.0,"render_returned_at":120.0,'
+            '"token_written_at":3900.0}}]'
+        )
+
+        timelines = parse_solver_timelines(text)
+        summary = summarize_solver_timelines(timelines)
+
+        self.assertEqual(len(timelines), 1)
+        self.assertEqual(summary["solver_timeline_count"], 1)
+        self.assertEqual(summary["ok_count"], 1)
+        self.assertEqual(summary["avg_click_call_ms"], 2500.0)
+        self.assertEqual(summary["avg_click_mouse_move_ms"], 2000.0)
+        self.assertEqual(summary["avg_render_to_token_ms"], 3800.0)
+        self.assertEqual(summary["avg_token_write_to_poll_done_ms"], 100.0)
+        self.assertEqual(summary["avg_poll_attempts"], 2.0)
+        self.assertEqual(summary["center_iframe_hit_ratio"], 0.0)
+        self.assertEqual(summary["turnstile_iframe_seen_ratio"], 0.0)
 
 
 if __name__ == "__main__":

@@ -33,14 +33,38 @@ class FakePage:
         self.route_calls = []
         self.mouse = types.SimpleNamespace(
             moves=[],
+            clicks=[],
             downs=0,
             ups=0,
             move=self._mouse_move,
+            click=self._mouse_click,
             down=self._mouse_down,
             up=self._mouse_up,
         )
         self.turnstile_token = ""
         self.turnstile_box = {"x": 160, "y": 45}
+        self.turnstile_page_trace = {
+            "created_at": 10.0,
+            "script_inserted_at": 11.0,
+            "script_loaded_at": 12.0,
+            "render_called_at": 13.0,
+            "render_returned_at": 14.0,
+            "token_written_at": None,
+            "token_len": 0,
+            "error": None,
+        }
+        self.turnstile_dom_snapshot = {
+            "widget": {"present": True, "x": 10, "y": 10, "w": 300, "h": 70, "visible": True},
+            "click_center": {"x": 160, "y": 45},
+            "element_at_center": {"tag": "IFRAME", "id": "", "class": "", "is_iframe": True},
+            "all_iframe_count": 1,
+            "turnstile_iframe_count": 1,
+            "iframe_summaries": [
+                {"host": "challenges.cloudflare.com", "path": "/turnstile/v0", "x": 10, "y": 10, "w": 300, "h": 70, "visible": True}
+            ],
+            "turnstile_loaded": True,
+            "response_input": {"present": True, "token_len": 0},
+        }
 
     async def set_viewport_size(self, size):
         self.viewport = size
@@ -61,6 +85,10 @@ class FakePage:
 
     async def evaluate(self, script):
         self.evaluations.append(script)
+        if "__csp_solver_snapshot" in script:
+            return self.turnstile_dom_snapshot
+        if "__cspTurnstileTrace" in script and "return window.__cspTurnstileTrace" in script:
+            return self.turnstile_page_trace
         if "cf-turnstile-response" in script:
             return self.turnstile_token
         if "getBoundingClientRect" in script and ".cf-turnstile" in script:
@@ -76,6 +104,9 @@ class FakePage:
 
     async def _mouse_move(self, x, y, steps=None):
         self.mouse.moves.append({"x": x, "y": y, "steps": steps})
+
+    async def _mouse_click(self, x, y):
+        self.mouse.clicks.append({"x": x, "y": y})
 
     async def _mouse_down(self):
         self.mouse.downs += 1
@@ -763,6 +794,107 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics.solver_reused_count, 1)
         self.assertEqual(metrics.solver_visible_frame_count, 0)
 
+    async def test_solver_timeline_records_click_and_token_events_when_enabled(self):
+        page = FakePage()
+        original_click = register._mouse_click_turnstile_center_trace
+        original_read = register._read_turnstile_token
+        clicked_once = False
+        timeline = register._new_solver_timeline(enabled=True)
+
+        async def fake_click(_page, **_kwargs):
+            nonlocal clicked_once
+            clicked_once = True
+            return True, {"box_eval_ms": 0.0}
+
+        async def fake_read(_page):
+            return "token-value-long" if clicked_once else ""
+
+        try:
+            register._mouse_click_turnstile_center_trace = fake_click
+            register._read_turnstile_token = fake_read
+
+            clicked = await register._repeat_mouse_click_turnstile(page, timeline=timeline)
+        finally:
+            register._mouse_click_turnstile_center_trace = original_click
+            register._read_turnstile_token = original_read
+
+        events = [event["event"] for event in timeline["events"]]
+        self.assertTrue(clicked)
+        self.assertIn("click_before", events)
+        self.assertIn("click_after", events)
+        self.assertTrue(any(event.get("dom", {}).get("widget", {}).get("present") for event in timeline["events"]))
+        self.assertTrue(any(event.get("click_call_ms", 0) >= 0 for event in timeline["events"]))
+        self.assertTrue(any(event.get("token_len", 0) > 10 for event in timeline["events"]))
+
+    async def test_turnstile_dom_snapshot_reports_click_target_without_text_or_full_urls(self):
+        page = FakePage()
+
+        snapshot = await register._turnstile_dom_snapshot(page)
+
+        self.assertEqual(snapshot["all_iframe_count"], 1)
+        self.assertEqual(snapshot["turnstile_iframe_count"], 1)
+        self.assertEqual(snapshot["widget"]["w"], 300)
+        self.assertEqual(snapshot["element_at_center"]["tag"], "IFRAME")
+        self.assertEqual(snapshot["iframe_summaries"][0]["host"], "challenges.cloudflare.com")
+        self.assertNotIn("src", snapshot["iframe_summaries"][0])
+        self.assertNotIn("text", snapshot["element_at_center"])
+
+    async def test_mouse_click_turnstile_center_can_return_timing_trace(self):
+        page = FakePage()
+
+        clicked, trace = await register._mouse_click_turnstile_center_trace(page)
+
+        self.assertTrue(clicked)
+        self.assertEqual(trace["click_x"], 160.0)
+        self.assertEqual(trace["click_y"], 45.0)
+        for key in ("box_eval_ms", "mouse_move1_ms", "mouse_move2_ms", "mouse_down_ms", "mouse_up_ms"):
+            self.assertIn(key, trace)
+            self.assertGreaterEqual(trace[key], 0)
+
+    async def test_inject_turnstile_widget_leaves_default_script_uninstrumented(self):
+        page = FakePage()
+
+        await register._inject_turnstile_widget(page)
+
+        script = page.evaluations[-1]
+        self.assertNotIn("__cspTurnstileTrace", script)
+
+    async def test_inject_turnstile_widget_records_page_timeline_when_enabled(self):
+        page = FakePage()
+
+        await register._inject_turnstile_widget(page, timeline=True)
+
+        script = page.evaluations[-1]
+        self.assertIn("__cspTurnstileTrace", script)
+        self.assertIn("script_inserted_at", script)
+        self.assertIn("render_called_at", script)
+        self.assertIn("token_written_at", script)
+
+    async def test_start_turnstile_challenge_records_page_trace_when_timeline_enabled(self):
+        browser = FakeBrowser()
+        messages = []
+        old_trace = register.SOLVER_TIMELINE_TRACE
+        old_sample = register.SOLVER_TIMELINE_SAMPLE
+        old_emitted = register._solver_timeline_emitted
+        old_log = register.log
+        try:
+            register.SOLVER_TIMELINE_TRACE = True
+            register.SOLVER_TIMELINE_SAMPLE = 1
+            register._solver_timeline_emitted = 0
+            register.log = messages.append
+
+            item = await register._start_turnstile_challenge(browser, fast_click=True)
+            await register._put_solver_page(item, False)
+        finally:
+            register.SOLVER_TIMELINE_TRACE = old_trace
+            register.SOLVER_TIMELINE_SAMPLE = old_sample
+            register._solver_timeline_emitted = old_emitted
+            register.log = old_log
+
+        events = item["timeline"]["events"]
+        self.assertTrue(any(event["event"] == "page_trace_after_inject" for event in events))
+        self.assertTrue(any(event["event"] == "page_trace_after_click" for event in events))
+
     async def test_solve_one_turnstile_uses_fast_click_by_default(self):
         calls = []
 
@@ -786,6 +918,87 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(token, "token-value")
         self.assertEqual(calls, [True])
+
+    async def test_wait_turnstile_logs_timeline_when_present(self):
+        messages = []
+
+        async def fake_poll(_page, **_kwargs):
+            return "token-value-long"
+
+        async def fake_put(_item, _ok):
+            return None
+
+        old_poll = register._poll_turnstile_token
+        old_put = register._put_solver_page
+        old_log = register.log
+        try:
+            register._poll_turnstile_token = fake_poll
+            register._put_solver_page = fake_put
+            register.log = messages.append
+            item = {
+                "page": object(),
+                "trace": {},
+                "timeline": {
+                    "start": register.time.time(),
+                    "events": [{"t": 0.1, "event": "x"}],
+                },
+            }
+
+            token = await register._wait_turnstile_challenge(item)
+        finally:
+            register._poll_turnstile_token = old_poll
+            register._put_solver_page = old_put
+            register.log = old_log
+
+        self.assertEqual(token, "token-value-long")
+        self.assertTrue(any(message.startswith("[solver_timeline] ") for message in messages))
+
+    async def test_wait_turnstile_timeline_logs_solve_id_and_poll_summary(self):
+        messages = []
+        page = FakePage()
+        page.turnstile_token = "token-value-long"
+        timeline = register._new_solver_timeline(enabled=True)
+
+        async def fake_put(_item, _ok):
+            return None
+
+        old_attempts = register.SOLVER_POLL_ATTEMPTS
+        old_interval = register.SOLVER_POLL_INTERVAL_MS
+        old_put = register._put_solver_page
+        old_sleep = register.asyncio.sleep
+        old_log = register.log
+        try:
+            register.SOLVER_POLL_ATTEMPTS = 1
+            register.SOLVER_POLL_INTERVAL_MS = 50
+
+            async def no_sleep(_seconds):
+                return None
+
+            register.asyncio.sleep = no_sleep
+            register._put_solver_page = fake_put
+            register.log = messages.append
+
+            token = await register._wait_turnstile_challenge({
+                "page": page,
+                "trace": {},
+                "timeline": timeline,
+            })
+        finally:
+            register.SOLVER_POLL_ATTEMPTS = old_attempts
+            register.SOLVER_POLL_INTERVAL_MS = old_interval
+            register.asyncio.sleep = old_sleep
+            register._put_solver_page = old_put
+            register.log = old_log
+
+        payload = next(message.removeprefix("[solver_timeline] ") for message in messages)
+        events = register.json.loads(payload)
+        poll_done = next(event for event in events if event["event"] == "poll_done")
+
+        self.assertEqual(token, "token-value-long")
+        self.assertIn("solve_id", poll_done)
+        self.assertEqual(poll_done["poll_attempts"], 1)
+        self.assertEqual(poll_done["first_token_attempt"], 1)
+        self.assertGreaterEqual(poll_done["poll_read_ms_max"], 0)
 
     async def test_mouse_click_turnstile_retries_uses_center_clicks(self):
         page = FakePage()

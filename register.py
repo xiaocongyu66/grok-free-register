@@ -427,6 +427,148 @@ SOLVER_POLL_ATTEMPTS = _env_int("SOLVER_POLL_ATTEMPTS", 100)
 SOLVER_FAST_CLICK = (os.environ.get("SOLVER_FAST_CLICK", "1").strip().lower() not in ("0", "false", "no"))
 SOLVER_MOUSE_CLICK_RETRIES = _env_int("SOLVER_MOUSE_CLICK_RETRIES", 3)
 SOLVER_MOUSE_CLICK_INTERVAL_MS = _env_int("SOLVER_MOUSE_CLICK_INTERVAL_MS", 600)
+SOLVER_TIMELINE_TRACE = (os.environ.get("SOLVER_TIMELINE_TRACE", "0").strip().lower() in ("1", "true", "yes"))
+SOLVER_TIMELINE_SAMPLE = _env_int("SOLVER_TIMELINE_SAMPLE", 8)
+_solver_timeline_emitted = 0
+_solver_timeline_next_id = 0
+
+
+def _new_solver_timeline(*, enabled=None):
+    global _solver_timeline_next_id
+    enabled = SOLVER_TIMELINE_TRACE if enabled is None else enabled
+    if not enabled:
+        return None
+    _solver_timeline_next_id += 1
+    return {"start": time.time(), "solve_id": _solver_timeline_next_id, "events": []}
+
+
+def _trace_solver_event(timeline, event, **fields):
+    if timeline is None:
+        return
+    item = {"t": round(time.time() - timeline["start"], 4), "event": event}
+    if "solve_id" in timeline:
+        item["solve_id"] = timeline["solve_id"]
+    item.update(fields)
+    timeline["events"].append(item)
+
+
+def _new_solver_poll_stats():
+    return {
+        "poll_attempts": 0,
+        "first_token_attempt": None,
+        "poll_read_ms_total": 0.0,
+        "poll_read_ms_max": 0.0,
+        "poll_read_count": 0,
+        "poll_retry_click_count": 0,
+    }
+
+
+def _finish_solver_poll_stats(stats):
+    if not stats:
+        return {}
+    read_count = stats.pop("poll_read_count", 0)
+    total = stats.pop("poll_read_ms_total", 0.0)
+    stats["poll_read_ms_avg"] = round(total / read_count, 1) if read_count else 0.0
+    stats["poll_read_ms_max"] = round(stats.get("poll_read_ms_max", 0.0), 1)
+    return stats
+
+
+async def _turnstile_frame_count(p):
+    try:
+        return await p.evaluate(
+            "() => document.querySelectorAll('iframe[src*=turnstile], iframe[src*=challenges.cloudflare.com]').length"
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return 0
+
+
+async def _turnstile_dom_snapshot(p):
+    try:
+        return await p.evaluate(
+            """() => {
+                const clip = (value, n = 96) => String(value || "").slice(0, n);
+                const rectInfo = (el) => {
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    return {
+                        x: Math.round(r.left),
+                        y: Math.round(r.top),
+                        w: Math.round(r.width),
+                        h: Math.round(r.height),
+                        visible: r.width >= 1 && r.height >= 1
+                    };
+                };
+                const elemInfo = (el) => {
+                    if (!el) return null;
+                    return {
+                        tag: clip(el.tagName),
+                        id: clip(el.id, 64),
+                        class: clip(el.className, 96),
+                        is_iframe: el.tagName === "IFRAME"
+                    };
+                };
+                const urlInfo = (src) => {
+                    try {
+                        const u = new URL(src || "", location.href);
+                        return {host: clip(u.host, 96), path: clip(u.pathname, 96)};
+                    } catch (_) {
+                        return {host: "", path: ""};
+                    }
+                };
+                const widget = document.querySelector(".cf-turnstile");
+                const wr = rectInfo(widget);
+                const center = wr ? {
+                    x: Math.round(wr.x + wr.w / 2),
+                    y: Math.round(wr.y + wr.h / 2)
+                } : null;
+                const centerEl = center ? document.elementFromPoint(center.x, center.y) : null;
+                const iframes = Array.from(document.querySelectorAll("iframe"));
+                const iframeSummaries = iframes.slice(0, 8).map((f) => {
+                    const info = Object.assign(urlInfo(f.getAttribute("src") || ""), rectInfo(f) || {});
+                    info.in_widget = widget ? widget.contains(f) : false;
+                    return info;
+                });
+                const isTurnstileFrame = (f) => {
+                    const src = f.getAttribute("src") || "";
+                    return src.includes("turnstile") || src.includes("challenges.cloudflare.com");
+                };
+                const response = document.querySelector('input[name="cf-turnstile-response"]');
+                return {
+                    __csp_solver_snapshot: true,
+                    ready_state: document.readyState,
+                    viewport: {w: window.innerWidth, h: window.innerHeight},
+                    widget: Object.assign({present: Boolean(widget)}, wr || {}),
+                    click_center: center,
+                    element_at_center: elemInfo(centerEl),
+                    all_iframe_count: iframes.length,
+                    turnstile_iframe_count: iframes.filter(isTurnstileFrame).length,
+                    iframe_summaries: iframeSummaries,
+                    turnstile_loaded: Boolean(window.turnstile),
+                    response_input: {
+                        present: Boolean(response),
+                        token_len: response && response.value ? response.value.length : 0
+                    }
+                };
+            }"""
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return {}
+
+
+async def _turnstile_page_trace(p):
+    try:
+        return await p.evaluate(
+            "() => window.__cspTurnstileTrace ? Object.assign({}, window.__cspTurnstileTrace) : null"
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+
 
 async def _get_solver_page(browser):
     if SOLVER_REUSE:
@@ -457,8 +599,11 @@ async def _put_solver_page(item, ok):
     try: await p.close()
     except Exception: pass
 
-async def _inject_turnstile_widget(p):
-    await p.evaluate(f"""var d=document.createElement('div');d.className='cf-turnstile';d.setAttribute('data-sitekey','{SITE_KEY}');d.style.cssText='position:fixed;top:10px;left:10px;z-index:99999;background:white;padding:12px;border:2px solid red;border-radius:6px;width:300px;height:70px';document.body.appendChild(d);function __r(){{window.turnstile&&window.turnstile.render(d,{{sitekey:'{SITE_KEY}',callback:function(t){{var i=document.querySelector('input[name="cf-turnstile-response"]');if(!i){{i=document.createElement('input');i.type='hidden';i.name='cf-turnstile-response';document.body.appendChild(i);}}i.value=t;}}}})}}if(window.turnstile){{__r()}}else{{var s=document.createElement('script');s.src='https://challenges.cloudflare.com/turnstile/v0/api.js';s.onload=function(){{setTimeout(__r,1000)}};document.head.appendChild(s);}}""")
+async def _inject_turnstile_widget(p, *, timeline=False):
+    if not timeline:
+        await p.evaluate(f"""var d=document.createElement('div');d.className='cf-turnstile';d.setAttribute('data-sitekey','{SITE_KEY}');d.style.cssText='position:fixed;top:10px;left:10px;z-index:99999;background:white;padding:12px;border:2px solid red;border-radius:6px;width:300px;height:70px';document.body.appendChild(d);function __r(){{window.turnstile&&window.turnstile.render(d,{{sitekey:'{SITE_KEY}',callback:function(t){{var i=document.querySelector('input[name="cf-turnstile-response"]');if(!i){{i=document.createElement('input');i.type='hidden';i.name='cf-turnstile-response';document.body.appendChild(i);}}i.value=t;}}}})}}if(window.turnstile){{__r()}}else{{var s=document.createElement('script');s.src='https://challenges.cloudflare.com/turnstile/v0/api.js';s.onload=function(){{setTimeout(__r,1000)}};document.head.appendChild(s);}}""")
+        return
+    await p.evaluate(f"""var __trace=window.__cspTurnstileTrace={{created_at:performance.now(),script_inserted_at:null,script_loaded_at:null,render_called_at:null,render_returned_at:null,token_written_at:null,token_len:0,error:null}};var d=document.createElement('div');d.className='cf-turnstile';d.setAttribute('data-sitekey','{SITE_KEY}');d.style.cssText='position:fixed;top:10px;left:10px;z-index:99999;background:white;padding:12px;border:2px solid red;border-radius:6px;width:300px;height:70px';document.body.appendChild(d);function __r(){{try{{if(!window.turnstile)return;__trace.render_called_at=performance.now();var __ret=window.turnstile.render(d,{{sitekey:'{SITE_KEY}',callback:function(t){{var i=document.querySelector('input[name="cf-turnstile-response"]');if(!i){{i=document.createElement('input');i.type='hidden';i.name='cf-turnstile-response';document.body.appendChild(i);}}i.value=t;__trace.token_written_at=performance.now();__trace.token_len=t?t.length:0;}}}});__trace.render_returned_at=performance.now();__trace.render_return_type=typeof __ret;}}catch(e){{__trace.error=e&&e.name?e.name:String(e);}}}}if(window.turnstile){{__r()}}else{{var s=document.createElement('script');s.src='https://challenges.cloudflare.com/turnstile/v0/api.js';s.onload=function(){{__trace.script_loaded_at=performance.now();setTimeout(__r,1000)}};__trace.script_inserted_at=performance.now();document.head.appendChild(s);}}""")
 
 
 async def _has_visible_turnstile_frame(p):
@@ -483,6 +628,13 @@ async def _read_turnstile_token(p):
 
 
 async def _mouse_click_turnstile_center(p):
+    clicked, _trace = await _mouse_click_turnstile_center_trace(p)
+    return clicked
+
+
+async def _mouse_click_turnstile_center_trace(p):
+    trace = {}
+    started = time.time()
     box = await p.evaluate(
         """() => {
             const e = document.querySelector('.cf-turnstile');
@@ -491,19 +643,30 @@ async def _mouse_click_turnstile_center(p):
             return {x: r.left + r.width / 2, y: r.top + r.height / 2};
         }"""
     )
+    trace["box_eval_ms"] = round((time.time() - started) * 1000, 1)
     if not box:
-        return False
+        return False, trace
     x = float(box["x"])
     y = float(box["y"])
+    trace["click_x"] = round(x, 1)
+    trace["click_y"] = round(y, 1)
+    started = time.time()
     await p.mouse.move(max(0, x - 25), max(0, y - 8))
+    trace["mouse_move1_ms"] = round((time.time() - started) * 1000, 1)
+    started = time.time()
     await p.mouse.move(x, y, steps=8)
+    trace["mouse_move2_ms"] = round((time.time() - started) * 1000, 1)
+    started = time.time()
     await p.mouse.down()
+    trace["mouse_down_ms"] = round((time.time() - started) * 1000, 1)
     await asyncio.sleep(0.05)
+    started = time.time()
     await p.mouse.up()
-    return True
+    trace["mouse_up_ms"] = round((time.time() - started) * 1000, 1)
+    return True, trace
 
 
-async def _repeat_mouse_click_turnstile(p):
+async def _repeat_mouse_click_turnstile(p, *, timeline=None):
     retries = max(0, SOLVER_MOUSE_CLICK_RETRIES)
     if retries <= 0:
         return False
@@ -511,23 +674,50 @@ async def _repeat_mouse_click_turnstile(p):
     interval = max(50, SOLVER_MOUSE_CLICK_INTERVAL_MS) / 1000.0
     for i in range(retries):
         token = await _read_turnstile_token(p)
+        dom = await _turnstile_dom_snapshot(p) if timeline is not None else None
+        iframe_count = dom.get("turnstile_iframe_count", 0) if dom else 0
+        _trace_solver_event(
+            timeline, "click_before", attempt=i + 1,
+            token_len=len(token or ""), iframe_count=iframe_count, dom=dom
+        )
         if token and len(token) > 10:
             return clicked
+        click_started = time.time()
+        click_error = None
         try:
-            clicked = await _mouse_click_turnstile_center(p) or clicked
+            if timeline is not None:
+                attempt_clicked, click_trace = await _mouse_click_turnstile_center_trace(p)
+            else:
+                attempt_clicked = await _mouse_click_turnstile_center(p)
+                click_trace = {}
+            clicked = attempt_clicked or clicked
         except asyncio.CancelledError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            click_error = type(exc).__name__
+            attempt_clicked = False
+            click_trace = {}
+        click_call_ms = round((time.time() - click_started) * 1000, 1)
+        token = await _read_turnstile_token(p) if timeline is not None else ""
+        dom = await _turnstile_dom_snapshot(p) if timeline is not None else None
+        iframe_count = dom.get("turnstile_iframe_count", 0) if dom else 0
+        _trace_solver_event(
+            timeline, "click_after", attempt=i + 1, clicked=clicked,
+            attempt_clicked=attempt_clicked,
+            token_len=len(token or ""), iframe_count=iframe_count,
+            click_call_ms=click_call_ms, click_error=click_error,
+            click_trace=click_trace, dom=dom
+        )
         if i != retries - 1:
             await asyncio.sleep(interval)
     return clicked
 
 
-async def _click_turnstile_if_possible(p, *, fast=False):
+async def _click_turnstile_if_possible(p, *, fast=False, timeline=None):
     if SOLVER_MOUSE_CLICK_RETRIES > 0:
-        return await _repeat_mouse_click_turnstile(p)
+        return await _repeat_mouse_click_turnstile(p, timeline=timeline)
     visible = await _has_visible_turnstile_frame(p)
+    _trace_solver_event(timeline, "visible_check", visible=visible)
     if fast and not visible:
         return visible
     click_timeout = 500 if fast else 3000
@@ -543,12 +733,22 @@ async def _click_turnstile_if_possible(p, *, fast=False):
     return visible
 
 
-async def _poll_turnstile_token(p):
+async def _poll_turnstile_token(p, *, stats=None):
     for i in range(SOLVER_POLL_ATTEMPTS):
         await asyncio.sleep(max(50, SOLVER_POLL_INTERVAL_MS) / 1000)
+        if stats is not None:
+            stats["poll_attempts"] = i + 1
+            read_started = time.time()
         try:
             t = await _read_turnstile_token(p)
+            if stats is not None:
+                read_ms = (time.time() - read_started) * 1000
+                stats["poll_read_count"] += 1
+                stats["poll_read_ms_total"] += read_ms
+                stats["poll_read_ms_max"] = max(stats["poll_read_ms_max"], read_ms)
             if t and len(t) > 10:
+                if stats is not None and stats["first_token_attempt"] is None:
+                    stats["first_token_attempt"] = i + 1
                 return t
         except asyncio.CancelledError:
             raise
@@ -556,7 +756,10 @@ async def _poll_turnstile_token(p):
             pass
         retry_every = max(1, int(10000 / max(50, SOLVER_POLL_INTERVAL_MS)))
         if i > 0 and i % retry_every == 0:
-            try: await p.locator(".cf-turnstile").first.click(timeout=1000)
+            try:
+                await p.locator(".cf-turnstile").first.click(timeout=1000)
+                if stats is not None:
+                    stats["poll_retry_click_count"] += 1
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -565,8 +768,13 @@ async def _poll_turnstile_token(p):
 
 
 async def _start_turnstile_challenge(browser, *, fast_click=False):
+    global _solver_timeline_emitted
     item = await _get_solver_page(browser)
     p = item["page"]
+    trace_timeline = SOLVER_TIMELINE_TRACE and _solver_timeline_emitted < SOLVER_TIMELINE_SAMPLE
+    if trace_timeline:
+        _solver_timeline_emitted += 1
+    timeline = _new_solver_timeline(enabled=trace_timeline)
     trace = {
         "goto_s": item.get("goto_s", 0.0),
         "reused": bool(item.get("reused", False)),
@@ -578,16 +786,38 @@ async def _start_turnstile_challenge(browser, *, fast_click=False):
         "visible_frame": False,
     }
     item["trace"] = trace
+    item["timeline"] = timeline
     try:
         stage_started = time.time()
-        await _inject_turnstile_widget(p)
+        _trace_solver_event(timeline, "inject_start")
+        await _inject_turnstile_widget(p, timeline=timeline is not None)
         trace["inject_s"] = time.time() - stage_started
+        _trace_solver_event(timeline, "inject_done")
+        if timeline is not None:
+            _trace_solver_event(
+                timeline, "page_trace_after_inject",
+                page_trace=await _turnstile_page_trace(p)
+            )
         stage_started = time.time()
         await p.wait_for_timeout(SOLVER_INITIAL_WAIT_MS)
         trace["initial_s"] = time.time() - stage_started
+        _trace_solver_event(timeline, "initial_done")
+        if timeline is not None:
+            _trace_solver_event(
+                timeline, "page_trace_after_initial",
+                page_trace=await _turnstile_page_trace(p)
+            )
         stage_started = time.time()
-        trace["visible_frame"] = await _click_turnstile_if_possible(p, fast=fast_click)
+        trace["visible_frame"] = await _click_turnstile_if_possible(
+            p, fast=fast_click, timeline=timeline
+        )
         trace["click_s"] = time.time() - stage_started
+        _trace_solver_event(timeline, "click_stage_done", clicked=bool(trace["visible_frame"]))
+        if timeline is not None:
+            _trace_solver_event(
+                timeline, "page_trace_after_click",
+                page_trace=await _turnstile_page_trace(p)
+            )
         return item
     except BaseException:
         await _put_solver_page(item, False)
@@ -598,15 +828,26 @@ async def _wait_turnstile_challenge(item):
     ok = False
     try:
         wait_started = time.time()
-        token = await _poll_turnstile_token(item["page"])
+        timeline = item.get("timeline")
+        poll_stats = _new_solver_poll_stats() if timeline is not None else None
+        _trace_solver_event(timeline, "poll_start")
+        token = await _poll_turnstile_token(item["page"], stats=poll_stats)
         item.get("trace", {})["wait_s"] = time.time() - wait_started
         ok = token is not None
+        page_trace = await _turnstile_page_trace(item["page"]) if timeline is not None else None
+        _trace_solver_event(
+            timeline, "poll_done", ok=ok, token_len=len(token or ""),
+            page_trace=page_trace, **_finish_solver_poll_stats(poll_stats)
+        )
         return token
     except asyncio.CancelledError:
         raise
     except Exception:
         return None
     finally:
+        timeline = item.get("timeline")
+        if timeline is not None:
+            log("[solver_timeline] " + json.dumps(timeline["events"], separators=(",", ":")))
         await _put_solver_page(item, ok)
 
 
