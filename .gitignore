@@ -7,9 +7,15 @@ keys/
 .venv/
 .DS_Store
 .claude/
+.codex-temp/
+.playwright-cli/
+.playwright-mcp/
 test_results/
 test_results_real/
 docs/developer-handoff.md
 docs/experiments/
 docs/research/
 tmp_*.py
+local-docs.png
+zz1cc-docs-full.png
+netquality-report-*.txt
