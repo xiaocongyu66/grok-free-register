@@ -181,6 +181,80 @@ python3 run_tests.py --list
 
 `run_tests.py` 默认输出到 `test_results/`，该目录是生成物。
 
+## xAI OAuth Enroller
+
+`xai_enroller/` 用于把已有 xAI 账号的 SSO 会话转换为 OAuth 凭据，并导入 CPA
+凭据库。它独立于注册流程运行：注册机不需要启动，已有账号也不需要重新注册。
+
+先执行一次依赖安装：
+
+```bash
+bash setup.sh
+```
+
+### 准备账号来源
+
+支持两种来源。
+
+文件模式每行一个账号，格式为 `账号标识<TAB>SSO`：
+
+```text
+account-001<TAB><sso-token>
+account-002<TAB><sso-token>
+```
+
+```bash
+chmod 600 /path/to/xai-sso.tsv
+export XAI_ENROLLER_SOURCE_KIND=file
+export XAI_ENROLLER_SOURCE_FILE=/path/to/xai-sso.tsv
+export XAI_ENROLLER_SOURCE_SALT=<随机盐>
+```
+
+SQLite 模式会从 `accounts` 表读取仍有效的账号：
+
+```bash
+export XAI_ENROLLER_SOURCE_KIND=sqlite
+export XAI_ENROLLER_SOURCE_DB=/path/to/accounts.db
+export XAI_ENROLLER_SOURCE_SALT=<随机盐>
+```
+
+两种模式都可指定本地运行记录文件：
+
+```bash
+export XAI_ENROLLER_LEDGER_PATH=/path/to/xai-enroller-ledger.db
+```
+
+### 配置 CPA 导入
+
+```bash
+export XAI_ENROLLER_SINK=cpa
+export XAI_ENROLLER_CPA_BASE_URL=https://cpa.example.com
+export XAI_ENROLLER_CPA_MANAGEMENT_SECRET=<管理密钥>
+```
+
+### 运行
+
+先用 HTTP 模式检查单个账号：
+
+```bash
+python -m xai_enroller --source "$XAI_ENROLLER_SOURCE_KIND" --target 1 --executor http
+```
+
+需要浏览器完成授权时，使用 Playwright：
+
+```bash
+python -m xai_enroller --source "$XAI_ENROLLER_SOURCE_KIND" --target 1 --executor playwright --sink cpa
+```
+
+默认并发为 `1`。可用参数：
+
+```bash
+python -m xai_enroller --target 10 --concurrency 2 --retry-attempts 1
+```
+
+运行结果会输出每个账号的状态：`imported` 表示已导入；`needs_browser` 表示需要
+浏览器确认；`needs_interaction` 表示需要人工处理登录、验证或授权页面。
+
 ## 开发文档
 
 [docs/architecture.md](docs/architecture.md) 记录并发模型、资源生命周期和必须保持的不变量。

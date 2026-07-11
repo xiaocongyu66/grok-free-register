@@ -12,6 +12,7 @@ keys/
 .playwright-mcp/
 test_results/
 test_results_real/
+xai-enroller-ledger.db*
 docs/developer-handoff.md
 docs/experiments/
 docs/research/
