@@ -36,10 +36,14 @@ python3 -m venv .venv
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -r requirements.txt
 
+# 本项目直接由 Playwright 启动二进制，因此显式准备 CloakBrowser Chromium。
+echo "[3/4] 下载 CloakBrowser Chromium..."
+.venv/bin/python -m cloakbrowser install
+
 # 创建输出目录
 mkdir -p keys
 
-echo "[3/3] 安装完成！"
+echo "[4/4] 安装完成！"
 echo ""
 echo "运行: .venv/bin/python register.py"
 echo "或:  bash run.sh"
