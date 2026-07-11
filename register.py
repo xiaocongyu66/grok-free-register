@@ -100,6 +100,10 @@ PAGE_BLOCK_STATIC_ASSETS = (
     os.environ.get("PAGE_BLOCK_STATIC_ASSETS", "0").strip().lower()
     in ("1", "true", "yes")
 )
+REGISTRATION_DIAGNOSTICS = (
+    os.environ.get("REGISTRATION_DIAGNOSTICS", "0").strip().lower()
+    in ("1", "true", "yes")
+)
 
 SITE_KEY = None
 ACTION_ID = None
@@ -116,6 +120,20 @@ POLL_EXECUTOR = ThreadPoolExecutor(max_workers=32)
 
 def log(msg): print(msg, flush=True)
 def rand_str(n=15): return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+
+def _signup_response_markers(text):
+    """将失败响应归类为固定标签，诊断时不输出任何服务端正文。"""
+    lowered = text.lower()
+    groups = {
+        "challenge": ("captcha", "cf-chl", "challenge-platform"),
+        "rate_limited": ("rate limit", "too many requests", "try again later"),
+        "signin_page": ("sign in", "log in"),
+        "signup_page": ("sign up", "create your account"),
+        "next_page": ("__next", "/_next/"),
+        "action_error": ("server action", "next-action", "digest"),
+    }
+    return ",".join(name for name, needles in groups.items() if any(x in lowered for x in needles)) or "unclassified"
+
 def pb_varint(n):
     parts = []
     while n > 0x7f: parts.append((n & 0x7f) | 0x80); n >>= 7
@@ -369,6 +387,8 @@ async def grpc_verify_code(page, email, code):
     frame = b'\x00' + struct.pack('>I', len(inner)) + inner
     fb64 = base64.b64encode(frame).decode()
     s = await page.evaluate(f"(async()=>{{var fb=Uint8Array.from(atob('{fb64}'),c=>c.charCodeAt(0));var r=await fetch('{SITE_URL}/auth_mgmt.AuthManagement/VerifyEmailValidationCode',{{method:'POST',headers:{{'content-type':'application/grpc-web+proto','x-grpc-web':'1','x-user-agent':'connect-es/2.1.1'}},body:fb.buffer}});return r.headers.get('grpc-status')||'0';}})()")
+    if REGISTRATION_DIAGNOSTICS and s != '0':
+        log(f'[C] verify rejected grpc_status={s}')
     return s == '0'
 
 async def server_action_register(page, email, password, code, turnstile_token):
@@ -383,7 +403,13 @@ async def server_action_register(page, email, password, code, turnstile_token):
         "turnstileToken": turnstile_token, "promptOnDuplicateEmail": True
     }])
     pb64 = base64.b64encode(payload.encode()).decode()
-    result_text = await page.evaluate(f"""(async()=>{{var r=await fetch('{SITE_URL}/sign-up',{{method:'POST',headers:{{'accept':'text/x-component','content-type':'text/plain;charset=UTF-8','next-router-state-tree':'{STATE_TREE}','next-action':'{ACTION_ID}'}},body:atob('{pb64}')}});return await r.text();}})()""")
+    if REGISTRATION_DIAGNOSTICS:
+        diagnostic_json = await page.evaluate(f"""(async()=>{{var r=await fetch('{SITE_URL}/sign-up',{{method:'POST',headers:{{'accept':'text/x-component','content-type':'text/plain;charset=UTF-8','next-router-state-tree':'{STATE_TREE}','next-action':'{ACTION_ID}'}},body:atob('{pb64}')}});return JSON.stringify({{status:r.status,retryAfter:r.headers.get('retry-after')||'',text:await r.text()}});}})()""")
+        diagnostic = json.loads(diagnostic_json)
+        result_text = diagnostic['text']
+    else:
+        diagnostic = None
+        result_text = await page.evaluate(f"""(async()=>{{var r=await fetch('{SITE_URL}/sign-up',{{method:'POST',headers:{{'accept':'text/x-component','content-type':'text/plain;charset=UTF-8','next-router-state-tree':'{STATE_TREE}','next-action':'{ACTION_ID}'}},body:atob('{pb64}')}});return await r.text();}})()""")
     # 注册响应里带一个 set-cookie 重定向 URL,必须访问它,x.ai 才会下发真正的 sso cookie(152 字符 JWT)。
     # 注意:直接解 q= 里的 JWT 取 config.token 是错的——那是 120 字符内部 blob,不是 sso 凭证。
     text = result_text.replace('\\/', '/')  # RSC 里 / 被转义成 \/
@@ -391,6 +417,12 @@ async def server_action_register(page, email, password, code, turnstile_token):
     if not m:
         m = re.search(r'(https://[^" \s\\]+set-cookie\?q=[A-Za-z0-9_.\-]+)', text)
     if not m:
+        if diagnostic is not None:
+            log(
+                f"[C] signup no session http_status={diagnostic['status']} "
+                f"retry_after={diagnostic['retryAfter'] or '-'} response_bytes={len(result_text)} "
+                f"markers={_signup_response_markers(result_text)}"
+            )
         return None
     url = m.group(1)
     if C_SET_COOKIE_VIA_REQUEST:
@@ -413,7 +445,10 @@ async def server_action_register(page, email, password, code, turnstile_token):
     except Exception:
         pass
     cookies = await page.context.cookies()
-    return next((c['value'] for c in cookies if c['name'] == 'sso'), None)
+    sso = next((c['value'] for c in cookies if c['name'] == 'sso'), None)
+    if REGISTRATION_DIAGNOSTICS and not sso:
+        log('[C] signup set-cookie completed without sso cookie')
+    return sso
 
 # solver 预热页面池:复用已停在 sign-up 的页面,省掉每次 page.goto 的重型 SPA 加载
 # SOLVER_REUSE=0 可关闭(用于 A/B 对比 goto 优化的增益)
