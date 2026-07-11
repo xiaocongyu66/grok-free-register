@@ -172,6 +172,19 @@ wait_slot() {
     container_running "${slot}" && wait_url "$(slot_url "${slot}")"
 }
 
+wait_runtime_slot_up() {
+    local slot="$1"
+    local attempt status
+    for attempt in $(seq 1 "${HEALTH_ATTEMPTS}"); do
+        status="$(runtime_status)"
+        if [[ "$(slot_field "${status}" "${slot}" status 2>/dev/null || true)" = "UP" ]]; then
+            return 0
+        fi
+        sleep "${SLEEP_SECONDS}"
+    done
+    return 1
+}
+
 set_active_slot() {
     validate_slot "$1"
     "${NEWAPI_AB}" "active-$1"
@@ -440,6 +453,7 @@ prepare_release() {
         [[ "$(container_image_id "${inactive}")" = "${actual_image_id}" ]]
         [[ "$(container_revision "${inactive}")" = "${revision}" ]]
         wait_slot "${inactive}"
+        wait_runtime_slot_up "${inactive}"
         [[ "$(active_slot_from_status "$(runtime_status)")" = "${active}" ]]
         wait_url "${STABLE_URL}"
     }; then

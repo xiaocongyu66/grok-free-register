@@ -134,6 +134,7 @@ class NewApiN8nWorkflowTest(unittest.TestCase):
         verify_code = nodes["Verify Candidate Prepared"]["parameters"]["jsCode"]
         self.assertIn("prepare.image_id", verify_code)
         self.assertIn("image_config_digest", verify_code)
+        self.assertIn("statusResult.code !== 0", verify_code)
 
         self.assertLess(
             self._node_index(workflow, "SSH: Status Before Build"),

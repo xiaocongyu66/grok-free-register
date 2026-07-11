@@ -222,9 +222,21 @@ const command = `prepare ${immutableImage} ${manifest.image_id} ${manifest.commi
 return [{ json: { ...request, manifest, immutableImage, command } }];
 """
     verify_prepared = r"""
-const before = JSON.parse($('SSH: Status Before Build').first().json.stdout);
-const prepare = JSON.parse($('SSH: Prepare Candidate').first().json.stdout);
-const after = JSON.parse($input.first().json.stdout);
+const beforeResult = $('SSH: Status Before Build').first().json;
+const prepareResult = $('SSH: Prepare Candidate').first().json;
+const statusResult = $input.first().json;
+if (beforeResult.code !== 0) {
+  throw new Error(`status before build failed: ${beforeResult.stderr}`);
+}
+if (prepareResult.code !== 0) {
+  throw new Error(`candidate prepare failed: ${prepareResult.stderr}`);
+}
+if (statusResult.code !== 0) {
+  throw new Error(`status after prepare failed: ${statusResult.stderr}`);
+}
+const before = JSON.parse(beforeResult.stdout);
+const prepare = JSON.parse(prepareResult.stdout);
+const after = JSON.parse(statusResult.stdout);
 const release = $('Validate Release Manifest').first().json;
 if (!before.ok || !prepare.ok || !after.ok) throw new Error('deployment command failed');
 if (before.active_slot !== after.active_slot) {

@@ -45,6 +45,8 @@ class NewApiReleaseTest(unittest.TestCase):
                 }
             )
         )
+        self.runtime_recovery_file = self.root / "runtime-recovery.json"
+        self.runtime_recovery_file.write_text("{}")
         self.docker_file = self.root / "docker.json"
         self.docker_file.write_text(
             json.dumps(
@@ -106,6 +108,7 @@ class NewApiReleaseTest(unittest.TestCase):
                 "NEWAPI_DEPLOY_STABLE_URL": "http://127.0.0.1:3010/api/status",
                 "NEWAPI_DEPLOY_PUBLIC_URL": "https://api.example.invalid/api/status",
                 "FAKE_RUNTIME_FILE": str(self.runtime_file),
+                "FAKE_RUNTIME_RECOVERY_FILE": str(self.runtime_recovery_file),
                 "FAKE_DOCKER_FILE": str(self.docker_file),
                 "FAKE_COMPOSE_FILE": str(self.compose),
                 "FAKE_COMMAND_LOG": str(self.command_log),
@@ -132,9 +135,21 @@ class NewApiReleaseTest(unittest.TestCase):
                 from pathlib import Path
 
                 path = Path(os.environ["FAKE_RUNTIME_FILE"])
+                recovery_path = Path(os.environ["FAKE_RUNTIME_RECOVERY_FILE"])
                 state = json.loads(path.read_text())
+                recovery = json.loads(recovery_path.read_text())
                 command = sys.argv[1]
                 if command == "status":
+                    for slot in ("a", "b"):
+                        remaining = recovery.get(slot, 0)
+                        if remaining > 0:
+                            state[slot]["status"] = "DOWN"
+                            recovery[slot] = remaining - 1
+                        elif slot in recovery:
+                            state[slot]["status"] = "UP"
+                            del recovery[slot]
+                    path.write_text(json.dumps(state))
+                    recovery_path.write_text(json.dumps(recovery))
                     for slot in ("a", "b"):
                         item = state[slot]
                         print(
@@ -167,6 +182,8 @@ class NewApiReleaseTest(unittest.TestCase):
                 state_path = Path(os.environ["FAKE_DOCKER_FILE"])
                 compose_path = Path(os.environ["FAKE_COMPOSE_FILE"])
                 log_path = Path(os.environ["FAKE_COMMAND_LOG"])
+                runtime_path = Path(os.environ["FAKE_RUNTIME_FILE"])
+                recovery_path = Path(os.environ["FAKE_RUNTIME_RECOVERY_FILE"])
                 state = json.loads(state_path.read_text())
                 args = sys.argv[1:]
                 with log_path.open("a") as handle:
@@ -236,6 +253,17 @@ class NewApiReleaseTest(unittest.TestCase):
                         "revision": image_item["revision"],
                     }
                     save()
+                    recovery_polls = int(
+                        os.environ.get("FAKE_RUNTIME_RECOVERY_POLLS", "0")
+                    )
+                    if recovery_polls:
+                        slot = service[-1]
+                        runtime = json.loads(runtime_path.read_text())
+                        runtime[slot]["status"] = "DOWN"
+                        runtime_path.write_text(json.dumps(runtime))
+                        recovery = json.loads(recovery_path.read_text())
+                        recovery[slot] = recovery_polls
+                        recovery_path.write_text(json.dumps(recovery))
                 else:
                     raise SystemExit("unsupported docker command: " + " ".join(args))
                 """
@@ -366,6 +394,24 @@ class NewApiReleaseTest(unittest.TestCase):
         self.assertEqual(
             docker["containers"]["new-api-ai-a"]["id"], "sha256:" + "3" * 64
         )
+
+    def test_prepare_waits_for_haproxy_to_observe_candidate_recovery(self):
+        result = self.run_deploy(
+            "prepare",
+            "ghcr.io/hechuyi/new-api-rtoc@sha256:" + "c" * 64,
+            "sha256:" + "c" * 64,
+            "c" * 40,
+            "release-c",
+            extra_env={
+                "FAKE_RUNTIME_RECOVERY_POLLS": "2",
+                "NEWAPI_DEPLOY_HEALTH_ATTEMPTS": "4",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runtime = json.loads(self.runtime_file.read_text())
+        self.assertEqual(runtime["a"]["status"], "UP")
+        self.assertEqual(runtime["a"]["weight"], 0)
+        self.assertEqual(runtime["b"]["weight"], 100)
 
     def test_cutover_switches_to_prepared_slot(self):
         self.prepare_candidate()
