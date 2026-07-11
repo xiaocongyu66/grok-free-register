@@ -52,6 +52,20 @@ def test_settings_accepts_bounded_retry_attempts(tmp_path):
     assert settings.retry_attempts == 2
 
 
+def test_settings_accepts_remote_source_without_a_local_source_file(tmp_path):
+    settings = Settings.from_environ(
+        base_env(
+            tmp_path,
+            XAI_ENROLLER_SOURCE_KIND="remote",
+            XAI_ENROLLER_SOURCE_FILE="",
+        )
+    )
+
+    assert settings.source_kind == "remote"
+    assert settings.source_file is None
+    assert settings.source_db is None
+
+
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [

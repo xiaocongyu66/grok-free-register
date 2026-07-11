@@ -24,6 +24,7 @@ class EnrollmentCoordinator:
         concurrency=1,
         timeout=1800,
         retry_attempts=0,
+        event_callback=None,
     ):
         self.source = source
         self.protocol = protocol
@@ -33,20 +34,31 @@ class EnrollmentCoordinator:
         self.concurrency = concurrency
         self.timeout = timeout
         self.retry_attempts = max(0, retry_attempts)
+        self.event_callback = event_callback
         self._semaphore = asyncio.Semaphore(concurrency)
 
     @staticmethod
     def _is_pre_device_transport_failure(error):
         return isinstance(error, (httpx.TransportError, OSError))
 
+    def _emit(self, kind, data):
+        if self.event_callback is None:
+            return
+        try:
+            self.event_callback(kind, data)
+        except Exception:
+            pass
+
     async def run(self, target=1):
+        return await self.run_records(self.source.records(), target=target)
+
+    async def run_records(self, records, target=100):
         if not 1 <= target <= 100:
             raise ValueError("target must be between 1 and 100")
         self.ledger.recover_pending()
         results = []
         tasks = []
         index = 0
-        records = self.source.records()
         if hasattr(records, "__aiter__"):
             async for source in records:
                 if index >= target:
@@ -95,6 +107,14 @@ class EnrollmentCoordinator:
                             ):
                                 continue
                             return result
+                        self._emit(
+                            "device_flow",
+                            {
+                                "source_id": source.source_id,
+                                "user_code": flow.user_code,
+                                "verification_url": flow.verification_url,
+                            },
+                        )
                         return await self._attempt_after_flow(source, job_id, flow, attempt)
                 except asyncio.TimeoutError:
                     result = JobResult(source.source_id, JobStatus.TIMEOUT, "timeout", attempt)

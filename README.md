@@ -86,11 +86,22 @@ EMAIL_API=http://127.0.0.1:8080
 
 ## 运行日志
 
-运行时会定期输出状态行，例如：
+直接运行 `bash start.sh` 时，终端只输出任务开始、成功或失败、累计平均速度和限流等待：
 
 ```text
-[*] T:0 Q:6 phys:0 s_phys:0.10/11.30 p_stage:0.02/1.10/1.70 c_stage:0.02/0.30/0.80 t_solve_avg:11.8 q_sent:44 q_ret:44 pair:38 ok:37 fail:0 rate:9.9/min #37
+[→] task #38 started
+[✓] task #38 success | avg:9.9/min | total:38
+[⏸] rate limited | waiting:60s
+[▶] rate limit cleared | recovered:61s
 ```
+
+需要调试并发、库存和阶段耗时时，使用：
+
+```bash
+REGISTER_LOG_MODE=debug bash start.sh
+```
+
+它会在上述任务事件之外，每 8 秒输出一次完整的 T/Q、物理并发和阶段耗时面板。
 
 常用字段：
 
@@ -194,7 +205,7 @@ bash setup.sh
 
 ### 准备账号来源
 
-支持两种来源。
+支持三种来源。
 
 文件模式每行一个账号，格式为 `账号标识<TAB>SSO`：
 
@@ -223,6 +234,33 @@ export XAI_ENROLLER_SOURCE_SALT=<随机盐>
 ```bash
 export XAI_ENROLLER_LEDGER_PATH=/path/to/xai-enroller-ledger.db
 ```
+
+### 注册机同步模式
+
+注册机和认证服务分开运行时，服务器保留原始的 `keys/accounts.txt`，本地认证服务
+通过 SSH 调用 `scripts/export_registered_sso.py`。导出器只传回 `邮箱<TAB>SSO`，不会
+输出或保存账号密码。
+
+先把当前仓库中的导出器同步到注册机同路径的 `scripts/` 目录，然后在本地配置：
+
+```bash
+export XAI_AUTH_SERVICE_SSH_HOST=ubuntu@your-server
+export XAI_AUTH_SERVICE_SSH_IDENTITY=/path/to/ssh-key.pem  # 使用 ssh-agent 时可省略
+export XAI_AUTH_SERVICE_REMOTE_ROOT=/opt/grok-free-register
+export XAI_AUTH_SERVICE_SYNC_SEC=30
+export XAI_ENROLLER_SOURCE_SALT=<随机盐>
+export XAI_ENROLLER_LEDGER_PATH=/path/to/xai-enroller-ledger.db
+```
+
+该模式默认使用 Playwright 自动完成已有 SSO 会话的授权确认，并在新账号同步后常驻
+运行：
+
+```bash
+bash auth-service.sh
+```
+
+终端只在同步到新账号或认证状态变化时输出。`s` 查看一次状态，`p` 暂停，`r` 恢复，
+`c` 取消当前批次，`q` 退出；`Ctrl-C` 同样会退出。
 
 ### 配置 CPA 导入
 

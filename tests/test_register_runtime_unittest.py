@@ -212,6 +212,8 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self._old_c_hot_page_pool = getattr(register, "C_HOT_PAGE_POOL", None)
         self._old_c_hot_page_pool_size = getattr(register, "C_HOT_PAGE_POOL_SIZE", None)
         self._old_c_set_cookie_via_request = getattr(register, "C_SET_COOKIE_VIA_REQUEST", None)
+        self._old_log_mode = getattr(register, "REGISTER_LOG_MODE", None)
+        self._old_rate_limit_circuit = register.REGISTRATION_RATE_LIMIT_CIRCUIT
 
     async def asyncTearDown(self):
         if hasattr(register, "_close_c_hot_page_pool"):
@@ -238,6 +240,11 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             delattr(register, "C_SET_COOKIE_VIA_REQUEST")
         elif self._old_c_set_cookie_via_request is not None:
             register.C_SET_COOKIE_VIA_REQUEST = self._old_c_set_cookie_via_request
+        if self._old_log_mode is None and hasattr(register, "REGISTER_LOG_MODE"):
+            delattr(register, "REGISTER_LOG_MODE")
+        elif self._old_log_mode is not None:
+            register.REGISTER_LOG_MODE = self._old_log_mode
+        register.REGISTRATION_RATE_LIMIT_CIRCUIT = self._old_rate_limit_circuit
 
     async def test_c_worker_timeout_releases_physical_and_pair_and_counts_failure(self):
         async def slow_verify(*_args, **_kwargs):
@@ -424,6 +431,7 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_monitor_uses_metrics_snapshot(self):
         register.STOP = asyncio.Event()
         register.TARGET = 1
+        register.REGISTER_LOG_MODE = "debug"
         messages = []
         register.log = messages.append
 
@@ -445,6 +453,80 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             any("pair:2 ok:1 fail:1" in message for message in messages),
             messages,
         )
+
+    async def test_monitor_hides_internal_snapshot_in_user_mode(self):
+        register.STOP = asyncio.Event()
+        register.TARGET = 1
+        register.REGISTER_LOG_MODE = "user"
+        messages = []
+        register.log = messages.append
+
+        metrics = Metrics()
+        metrics.success_count = 1
+        sems = {
+            "physical": asyncio.Semaphore(1),
+            "t_slot": asyncio.Semaphore(1),
+            "q_slot": asyncio.Semaphore(1),
+            "q_pending": asyncio.Semaphore(1),
+        }
+
+        await register.monitor(FakeInventory(), sems, metrics, interval=0)
+
+        self.assertFalse(any(message.startswith("[*] T:") for message in messages), messages)
+
+    async def test_user_event_format_reports_only_registration_outcomes(self):
+        self.assertEqual(
+            register.format_user_registration_event("started", task_id=7),
+            "[→] task #7 started",
+        )
+        self.assertEqual(
+            register.format_user_registration_event(
+                "success", task_id=7, count=5, rate_per_minute=12.34
+            ),
+            "[✓] task #7 success | avg:12.3/min | total:5",
+        )
+        self.assertEqual(
+            register.format_user_registration_event("failed", task_id=7),
+            "[✗] task #7 failed",
+        )
+        self.assertEqual(
+            register.format_user_registration_event("rate_limited", wait_seconds=60),
+            "[⏸] rate limited | waiting:60s",
+        )
+        self.assertEqual(
+            register.format_user_registration_event("recovered", wait_seconds=61),
+            "[▶] rate limit cleared | recovered:61s",
+        )
+
+    async def test_rate_limit_circuit_measures_one_recovery_window(self):
+        now = [100.0]
+        circuit = register.RegistrationRateLimitCircuit(
+            cooldown_seconds=60,
+            clock=lambda: now[0],
+        )
+        circuit.trip()
+        now[0] = 161.5
+
+        self.assertEqual(circuit.consume_recovery_seconds(), 61.5)
+        self.assertIsNone(circuit.consume_recovery_seconds())
+
+    async def test_rate_limit_probe_is_released_when_consume_times_out(self):
+        async def slow_verify(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        register.REGISTRATION_RATE_LIMIT_CIRCUIT = register.RegistrationRateLimitCircuit(0)
+        register.REGISTRATION_RATE_LIMIT_CIRCUIT.trip()
+        register.grpc_verify_code = slow_verify
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                register._consume_pair(
+                    FakeBrowser(), asyncio.Semaphore(1), FakePair(), Metrics(), task_id=1
+                ),
+                timeout=0.01,
+            )
+
+        self.assertFalse(register.REGISTRATION_RATE_LIMIT_CIRCUIT._probe_active)
 
     async def test_auto_capacity_is_bounded_by_cpu_and_memory(self):
         roomy = register.derive_capacity(

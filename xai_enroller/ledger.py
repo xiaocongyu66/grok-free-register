@@ -64,6 +64,14 @@ class Ledger:
                 (JobStatus.CANCELLED.value, datetime.now(timezone.utc).isoformat(), "recovered_pending"),
             )
 
+    def has_imported(self, source_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM jobs WHERE source_fingerprint=? AND status=? LIMIT 1",
+                (self._fingerprint(source_id), JobStatus.IMPORTED.value),
+            ).fetchone()
+        return row is not None
+
     def get(self, job_id):
         with self._connect() as connection:
             row = connection.execute(

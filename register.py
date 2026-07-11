@@ -107,6 +107,9 @@ REGISTRATION_DIAGNOSTICS = (
 REGISTRATION_RATE_LIMIT_COOLDOWN = max(
     60, _env_int("REGISTRATION_RATE_LIMIT_COOLDOWN", 60)
 )
+REGISTER_LOG_MODE = (os.environ.get("REGISTER_LOG_MODE") or "user").strip().lower()
+if REGISTER_LOG_MODE not in {"user", "debug"}:
+    REGISTER_LOG_MODE = "user"
 
 SITE_KEY = None
 ACTION_ID = None
@@ -122,7 +125,25 @@ SOLVE, PRODUCE, CONSUME, IDLE = 'SOLVE', 'PRODUCE', 'CONSUME', 'IDLE'
 POLL_EXECUTOR = ThreadPoolExecutor(max_workers=32)
 
 def log(msg): print(msg, flush=True)
+def debug_log(msg):
+    if REGISTER_LOG_MODE == "debug":
+        log(msg)
 def rand_str(n=15): return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+
+
+def format_user_registration_event(kind, *, task_id=None, count=None, rate_per_minute=None, wait_seconds=None):
+    label = f"task #{task_id}" if task_id is not None else "task"
+    if kind == "started":
+        return f"[→] {label} started"
+    if kind == "success":
+        return f"[✓] {label} success | avg:{rate_per_minute:.1f}/min | total:{count}"
+    if kind == "failed":
+        return f"[✗] {label} failed"
+    if kind == "rate_limited":
+        return f"[⏸] rate limited | waiting:{wait_seconds}s"
+    if kind == "recovered":
+        return f"[▶] rate limit cleared | recovered:{wait_seconds}s"
+    raise ValueError(f"unknown user registration event: {kind}")
 
 
 class RegistrationRateLimited(RuntimeError):
@@ -136,6 +157,8 @@ class RegistrationRateLimitCircuit:
         self.cooldown_seconds = cooldown_seconds
         self._clock = clock
         self._blocked_until = 0.0
+        self._tripped_at = None
+        self._probe_active = False
 
     def remaining_seconds(self):
         return max(0, int(self._blocked_until - self._clock() + 0.999))
@@ -145,6 +168,9 @@ class RegistrationRateLimitCircuit:
 
     def trip(self):
         was_open = self.is_open()
+        if not was_open:
+            self._tripped_at = self._clock()
+            self._probe_active = False
         self._blocked_until = max(
             self._blocked_until,
             self._clock() + self.cooldown_seconds,
@@ -152,8 +178,32 @@ class RegistrationRateLimitCircuit:
         return not was_open
 
     async def wait(self):
-        while self.is_open():
-            await asyncio.sleep(min(self.remaining_seconds(), 5))
+        waited = False
+        while self.is_open() or (self._tripped_at is not None and self._probe_active):
+            if self.is_open():
+                waited = True
+                await asyncio.sleep(min(self.remaining_seconds(), 5))
+                continue
+            if not self._probe_active:
+                break
+            await asyncio.sleep(0.2)
+        if self._tripped_at is not None and not self._probe_active:
+            self._probe_active = True
+            return True
+        return waited
+
+    def consume_recovery_seconds(self):
+        if self._tripped_at is None:
+            return None
+        elapsed = self._clock() - self._tripped_at
+        self._tripped_at = None
+        self._blocked_until = 0.0
+        self._probe_active = False
+        return elapsed
+
+    def release_probe(self):
+        if self._tripped_at is not None:
+            self._probe_active = False
 
 
 REGISTRATION_RATE_LIMIT_CIRCUIT = RegistrationRateLimitCircuit(
@@ -349,7 +399,7 @@ def derive_c_hot_page_pool_size(physical_cap, c_workers, configured_size=None):
 # ──────────────────────────────────────────────
 async def fetch_config():
     global SITE_KEY, ACTION_ID, STATE_TREE
-    log('[*] Fetching config...')
+    debug_log('[*] Fetching config...')
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(executable_path=find_chrome(), headless=True)
         try:
@@ -358,7 +408,7 @@ async def fetch_config():
             await page.wait_for_timeout(5000)
             html = await page.content()
             m = re.search(r'0x4AAAAAAA[a-zA-Z0-9_-]+', html)
-            if m: SITE_KEY = m.group(0); log(f'[+] SITE_KEY: {SITE_KEY}')
+            if m: SITE_KEY = m.group(0); debug_log(f'[+] SITE_KEY: {SITE_KEY}')
             for chunk in re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.DOTALL):
                 if 'sign-up' not in chunk: continue
                 decoded = chunk.replace('\\"', '"')
@@ -368,7 +418,7 @@ async def fetch_config():
                 end_idx = decoded.find('"$undefined"', f_start)
                 if end_idx < 0: continue
                 STATE_TREE = quote(decoded[f_start:end_idx].replace('\\\\"', '"').replace('\\', ''), safe='')
-                log(f'[+] STATE_TREE: {STATE_TREE[:50]}...')
+                debug_log(f'[+] STATE_TREE: {STATE_TREE[:50]}...')
                 break
             js_urls = re.findall(r'src="(/_next/static/[^"]+\.js)"', html)
             for js_url in js_urls[:50]:
@@ -382,7 +432,7 @@ async def fetch_config():
                     raise
                 except Exception:
                     continue
-            if ACTION_ID: log(f'[+] ACTION_ID: {ACTION_ID}')
+            if ACTION_ID: debug_log(f'[+] ACTION_ID: {ACTION_ID}')
         finally:
             await browser.close()
     if not all([SITE_KEY, ACTION_ID, STATE_TREE]):
@@ -1507,7 +1557,7 @@ async def p_worker(
         await asyncio.sleep(0.2)
 
 
-async def _consume_pair(browser, physical_sem, pair, metrics):
+async def _consume_pair(browser, physical_sem, pair, metrics, task_id=None):
     """执行一次 C 消费。返回 True 表示业务成功,False 表示消费失败。"""
     global success_count
     email = pair.q.value['email']
@@ -1515,7 +1565,7 @@ async def _consume_pair(browser, physical_sem, pair, metrics):
     code = pair.q.value['code']
     token = pair.t.value
 
-    await REGISTRATION_RATE_LIMIT_CIRCUIT.wait()
+    recovery_probe = await REGISTRATION_RATE_LIMIT_CIRCUIT.wait()
 
     physical_wait_started = time.time()
     await physical_sem.acquire()
@@ -1523,6 +1573,7 @@ async def _consume_pair(browser, physical_sem, pair, metrics):
     metrics.c_physical_count += 1
     metrics.c_physical_wait_seconds += physical_hold_started - physical_wait_started
     t0 = time.time()
+    recovery_completed = False
     try:
         try:
             async with _c_page_lease(browser, metrics) as page:
@@ -1543,10 +1594,11 @@ async def _consume_pair(browser, physical_sem, pair, metrics):
         except RegistrationRateLimited:
             if REGISTRATION_RATE_LIMIT_CIRCUIT.trip():
                 log(
-                    "[C] signup rate limited; pausing new registration submissions "
-                    f"for {REGISTRATION_RATE_LIMIT_CIRCUIT.remaining_seconds()}s"
+                    format_user_registration_event(
+                        "rate_limited",
+                        wait_seconds=REGISTRATION_RATE_LIMIT_CIRCUIT.remaining_seconds(),
+                    )
                 )
-            log(f'[✗] {email} register rate limited')
             return False
 
         if sso:
@@ -1559,13 +1611,34 @@ async def _consume_pair(browser, physical_sem, pair, metrics):
                 metrics.success_count += 1
                 success_count = metrics.success_count
                 count = metrics.success_count
-            avg = (time.time() - metrics.start_time) / count
-            log(f'[✓] {email} {elapsed:.1f}s avg:{avg:.1f}s #{count}')
+            runtime = time.time() - metrics.start_time
+            rate = count / (runtime / 60) if runtime > 0 else 0
+            log(
+                format_user_registration_event(
+                    "success",
+                    task_id=task_id,
+                    count=count,
+                    rate_per_minute=rate,
+                )
+            )
+            if recovery_probe:
+                recovered_after = REGISTRATION_RATE_LIMIT_CIRCUIT.consume_recovery_seconds()
+                recovery_completed = True
+                if recovered_after is not None:
+                    log(
+                        format_user_registration_event(
+                            "recovered", wait_seconds=round(recovered_after)
+                        )
+                    )
             return True
 
-        log(f'[✗] {email} register failed')
+        if recovery_probe:
+            REGISTRATION_RATE_LIMIT_CIRCUIT.release_probe()
+        log(format_user_registration_event("failed", task_id=task_id))
         return False
     finally:
+        if recovery_probe and not recovery_completed:
+            REGISTRATION_RATE_LIMIT_CIRCUIT.release_probe()
         metrics.c_physical_hold_seconds += time.time() - physical_hold_started
         physical_sem.release()
 
@@ -1575,11 +1648,13 @@ async def c_worker(wid, browser, inventory, physical_sem, metrics, admission_gat
     while not STOP.is_set():
         try:
             async with inventory.claim_pair() as pair:
+                task_id = metrics.pair_claimed
+                log(format_user_registration_event("started", task_id=task_id))
                 if admission_gate is not None:
                     await admission_gate.notify_changed()
                 try:
                     ok = await asyncio.wait_for(
-                        _consume_pair(browser, physical_sem, pair, metrics),
+                        _consume_pair(browser, physical_sem, pair, metrics, task_id=task_id),
                         timeout=C_CONSUME_TIMEOUT,
                     )
                     if ok:
@@ -1588,7 +1663,7 @@ async def c_worker(wid, browser, inventory, physical_sem, metrics, admission_gat
                         metrics.pair_consumed_fail += 1
                 except asyncio.TimeoutError:
                     metrics.pair_consumed_fail += 1
-                    log(f'[C] {wid} consume timeout after {C_CONSUME_TIMEOUT}s')
+                    log(format_user_registration_event("failed", task_id=task_id))
 
         except asyncio.CancelledError:
             raise
@@ -1605,7 +1680,8 @@ async def monitor(inventory, sems, metrics, interval=8):
     """定期输出系统状态。"""
     while not STOP.is_set():
         await asyncio.sleep(interval)
-        log(metrics.snapshot(inventory, sems))
+        if REGISTER_LOG_MODE == "debug":
+            log(metrics.snapshot(inventory, sems))
         if TARGET and metrics.success_count >= TARGET:
             log(f'[*] 已达目标 {TARGET} 个,停止。'); STOP.set()
 
@@ -1642,39 +1718,39 @@ async def main():
     if EMAIL_MODE == 'custom' and not EMAIL_DOMAIN:
         log("[!] custom 模式需在 .env 设置 EMAIL_DOMAIN(并运行 email_server.py)"); sys.exit(1)
 
-    log("=" * 50)
-    log(f"  Grok Free Register (CSP Architecture)")
-    log(f"  CPU: {cpu} cores  Memory: {resources['available_mem']}/{resources['total_mem']}MB")
-    log(f"  MaxMemForAuto: {resources['max_mem']}MB  MemReserve: {MIN_FREE_MEM_MB}MB  PhysicalMemBudget: {PHYSICAL_MEM_MB}MB")
+    debug_log("=" * 50)
+    debug_log(f"  Grok Free Register (CSP Architecture)")
+    debug_log(f"  CPU: {cpu} cores  Memory: {resources['available_mem']}/{resources['total_mem']}MB")
+    debug_log(f"  MaxMemForAuto: {resources['max_mem']}MB  MemReserve: {MIN_FREE_MEM_MB}MB  PhysicalMemBudget: {PHYSICAL_MEM_MB}MB")
     if capacity_profile:
-        log(f"  CapacityProfile: {CAPACITY_PROFILE} physical_cap={capacity_profile.get('physical_cap')}")
-    log(f"  EmailMode: {EMAIL_MODE}" + (f" ({EMAIL_DOMAIN})" if EMAIL_MODE == 'custom' else ""))
-    log(f"  Physical_Sem={physical_cap}  T_Slot={T_SLOT_CAP}  Q_Slot={Q_SLOT_CAP}  Q_Pending={Q_PENDING_CAP}")
-    log(
+        debug_log(f"  CapacityProfile: {CAPACITY_PROFILE} physical_cap={capacity_profile.get('physical_cap')}")
+    debug_log(f"  EmailMode: {EMAIL_MODE}" + (f" ({EMAIL_DOMAIN})" if EMAIL_MODE == 'custom' else ""))
+    debug_log(f"  Physical_Sem={physical_cap}  T_Slot={T_SLOT_CAP}  Q_Slot={Q_SLOT_CAP}  Q_Pending={Q_PENDING_CAP}")
+    debug_log(
         f"  Admission: T_LOW/HIGH={admission_watermarks['t_low']}/{admission_watermarks['t_high']}  "
         f"Q_LOW/HIGH={admission_watermarks['q_low']}/{admission_watermarks['q_high']}"
     )
-    log(f"  P_BatchMax={P_BATCH_MAX}  P_Send_Sem={'disabled' if p_send_cap == 0 else p_send_cap}")
-    log(
+    debug_log(f"  P_BatchMax={P_BATCH_MAX}  P_Send_Sem={'disabled' if p_send_cap == 0 else p_send_cap}")
+    debug_log(
         f"  C_HotPagePool={'on' if C_HOT_PAGE_POOL else 'off'}"
         f" size={_c_hot_page_pool_size if C_HOT_PAGE_POOL else 0}"
         f" setCookieViaRequest={'on' if C_SET_COOKIE_VIA_REQUEST else 'off'}"
     )
-    log(f"  Workers: S={s_workers} P={p_workers} C={c_workers}")
-    log(f"  Timeouts: P_Request={P_REQUEST_TIMEOUT}s  C_Consume={C_CONSUME_TIMEOUT}s")
-    log(
+    debug_log(f"  Workers: S={s_workers} P={p_workers} C={c_workers}")
+    debug_log(f"  Timeouts: P_Request={P_REQUEST_TIMEOUT}s  C_Consume={C_CONSUME_TIMEOUT}s")
+    debug_log(
         f"  SolverMouseClick: retries={SOLVER_MOUSE_CLICK_RETRIES} "
         f"interval={SOLVER_MOUSE_CLICK_INTERVAL_MS}ms"
     )
     if TARGET:
-        log(f"  Target: {TARGET}")
-    log("=" * 50)
+        debug_log(f"  Target: {TARGET}")
+    debug_log("=" * 50)
 
     await fetch_config()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(executable_path=find_chrome(), headless=True)
-        log('[*] Browser launched')
+        debug_log('[*] Browser launched')
 
         # CSP 组件
         metrics = Metrics()
@@ -1736,7 +1812,7 @@ async def main():
         # Monitor
         tasks.append(asyncio.create_task(monitor(inventory, sems, metrics)))
 
-        log(f'[*] CSP up: S={s_workers} P={p_workers} C={c_workers} workers')
+        debug_log(f'[*] CSP up: S={s_workers} P={p_workers} C={c_workers} workers')
 
         try:
             await asyncio.gather(*tasks)

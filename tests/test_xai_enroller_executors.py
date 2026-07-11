@@ -223,3 +223,16 @@ def test_playwright_executor_uses_fingerprint_browser_path_from_environment(monk
         "headless": True,
         "executable_path": "/opt/cloakbrowser/chrome",
     }
+
+
+def test_playwright_executor_finds_macos_cloakbrowser_binary(monkeypatch):
+    macos_binary = (
+        "/Users/test/.cloakbrowser/chromium-145/Chromium.app/Contents/MacOS/Chromium"
+    )
+    monkeypatch.delenv("XAI_ENROLLER_BROWSER_EXECUTABLE", raising=False)
+    monkeypatch.setattr(
+        "xai_enroller.executors.glob.glob",
+        lambda pattern: [macos_binary] if "Chromium.app" in pattern else [],
+    )
+
+    assert PlaywrightExecutor._find_executable_path() == macos_binary

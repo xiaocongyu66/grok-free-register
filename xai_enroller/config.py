@@ -40,8 +40,8 @@ class Settings:
     def from_environ(cls, env=None):
         env = dict(os.environ if env is None else env)
         source_kind = env.get("XAI_ENROLLER_SOURCE_KIND", "file")
-        if source_kind not in {"file", "sqlite"}:
-            raise ValueError("source kind must be file or sqlite")
+        if source_kind not in {"file", "sqlite", "remote"}:
+            raise ValueError("source kind must be file, sqlite, or remote")
         source_file = Path(env["XAI_ENROLLER_SOURCE_FILE"]) if env.get("XAI_ENROLLER_SOURCE_FILE") else None
         source_db = Path(env["XAI_ENROLLER_SOURCE_DB"]) if env.get("XAI_ENROLLER_SOURCE_DB") else None
         if source_kind == "file" and source_file is None:

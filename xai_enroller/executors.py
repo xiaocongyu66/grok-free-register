@@ -52,8 +52,13 @@ class PlaywrightExecutor:
         configured = os.environ.get("XAI_ENROLLER_BROWSER_EXECUTABLE")
         if configured:
             return configured
-        candidates = glob.glob(
-            os.path.expanduser("~/.cloakbrowser/chromium-*/chrome")
+        candidates = glob.glob(os.path.expanduser("~/.cloakbrowser/chromium-*/chrome"))
+        candidates.extend(
+            glob.glob(
+                os.path.expanduser(
+                    "~/.cloakbrowser/chromium-*/Chromium.app/Contents/MacOS/Chromium"
+                )
+            )
         )
         return sorted(candidates)[-1] if candidates else None
 

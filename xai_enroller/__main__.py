@@ -42,6 +42,8 @@ async def main_async(args=None):
     merged = dict(os.environ)
     merged.update(env)
     settings = Settings.from_environ(merged)
+    if settings.source_kind == "remote":
+        raise ValueError("remote source requires the local auth service entrypoint")
     source = (
         FileSourceAdapter(settings.source_file)
         if settings.source_kind == "file"

@@ -125,6 +125,54 @@ def test_coordinator_limits_concurrency_and_maps_terminal_results(tmp_path):
     assert protocol.polls == 2
 
 
+def test_coordinator_accepts_explicit_synced_records(tmp_path):
+    coordinator = EnrollmentCoordinator(
+        source=Source(),
+        protocol=Protocol(),
+        executor=Executor(),
+        sink=Sink(),
+        ledger_path=tmp_path / "ledger.db",
+        ledger_salt=b"salt",
+        concurrency=1,
+        timeout=5,
+    )
+
+    results = asyncio.run(
+        coordinator.run_records([SourceRecord("synced-account", "synced-sso")])
+    )
+
+    assert [result.source_id for result in results] == ["synced-account"]
+    assert results[0].status is JobStatus.IMPORTED
+
+
+def test_coordinator_emits_device_flow_after_the_flow_is_created(tmp_path):
+    events = []
+    coordinator = EnrollmentCoordinator(
+        source=Source(),
+        protocol=Protocol(),
+        executor=Executor(),
+        sink=Sink(),
+        ledger_path=tmp_path / "ledger.db",
+        ledger_salt=b"salt",
+        concurrency=1,
+        timeout=5,
+        event_callback=lambda kind, data: events.append((kind, data)),
+    )
+
+    asyncio.run(coordinator.run_records([SourceRecord("synced-account", "synced-sso")]))
+
+    assert events == [
+        (
+            "device_flow",
+            {
+                "source_id": "synced-account",
+                "user_code": "code",
+                "verification_url": "https://accounts.x.ai/device",
+            },
+        )
+    ]
+
+
 def test_coordinator_without_sink_never_reports_imported(tmp_path):
     coordinator = EnrollmentCoordinator(
         source=Source(),
