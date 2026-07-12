@@ -93,22 +93,22 @@ EMAIL_API=http://127.0.0.1:8080
 
 ## 运行日志
 
-直接运行 `bash start.sh` 时，终端只输出任务开始、成功或失败、累计平均速度和限流等待：
+直接运行 `bash start.sh` 时，终端只输出任务开始、成功或失败、近五分钟速度、累计数量和限流等待：
 
 ```text
-[→] task #38 started
-[✓] task #38 success | avg:9.9/min | total:38
-[⏸] rate limited | waiting:60s
-[▶] rate limit cleared | recovered:61s
+[→] 开始注册 #38
+[✓] 注册成功 #38 | 近5分钟 9.9/分 | 累计 38
+[⏸] 触发限流 | 60秒后恢复探测
+[▶] 限流解除 | 实际等待 61秒
 ```
 
 需要调试并发、库存和阶段耗时时，使用：
 
 ```bash
-REGISTER_LOG_MODE=debug bash start.sh
+bash start.sh --debug
 ```
 
-它会在上述任务事件之外，每 8 秒输出一次完整的 T/Q、物理并发和阶段耗时面板。
+它会在上述任务事件之外，每 8 秒输出一次完整的 T/Q、物理并发和阶段耗时面板。已有自动化环境也可继续使用 `REGISTER_LOG_MODE=debug`。
 
 常用字段：
 
@@ -270,6 +270,12 @@ export XAI_AUTH_SERVICE_SYNC_SEC=30
 
 ```bash
 bash auth-service.sh
+```
+
+需要查看队列、重试、节拍和冷却探针时使用：
+
+```bash
+bash auth-service.sh --debug
 ```
 
 默认每次认证至少间隔 10 秒；实测该值比无间隔运行有更高的长期平均成功速率。限流后
