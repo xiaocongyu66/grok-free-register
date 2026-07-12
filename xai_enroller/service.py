@@ -431,6 +431,10 @@ class EventTerminal:
     def _pending(value):
         return "—" if value is None else str(value)
 
+    @staticmethod
+    def _task_suffix(value):
+        return "" if value is None else f" #{value}"
+
     def _format_user(self, kind, data):
         if kind == "startup":
             return (
@@ -461,7 +465,7 @@ class EventTerminal:
         if kind == "result":
             if data.get("status") == "imported":
                 return (
-                    f"[✓] 认证成功 #{data.get('task_number', '—')} | "
+                    f"[✓] 认证成功{self._task_suffix(data.get('task_number'))} | "
                     f"运行平均 {self._rate(data.get('lifetime_imports_per_minute'))} | "
                     f"累计 {data['imported_unique']} | 可用 {data.get('available', '—')}"
                 )
@@ -469,7 +473,7 @@ class EventTerminal:
             if reason == "rate_limited":
                 return None
             action = "暂时失败，将自动重试" if reason in self._TRANSIENT_REASONS else "已跳过"
-            return f"[✗] 认证未完成 #{data.get('task_number', '—')} | {action}"
+            return f"[✗] 认证未完成{self._task_suffix(data.get('task_number'))} | {action}"
         if kind == "control":
             states = {
                 "paused": "[⏸] 认证服务已暂停",

@@ -109,6 +109,25 @@ def test_user_status_distinguishes_unknown_runtime_rate_from_zero_rate():
     assert "source_queue" not in messages[0]
 
 
+def test_user_terminal_omits_missing_task_number_before_authorization_starts():
+    messages = []
+    terminal = EventTerminal(mode="user", output=messages.append)
+
+    terminal.emit(
+        (
+            "result",
+            {
+                "status": "failed",
+                "reason": "device_flow_failed",
+                "task_number": None,
+            },
+        )
+    )
+
+    assert messages == ["[✗] 认证未完成 | 暂时失败，将自动重试"]
+    assert "None" not in messages[0]
+
+
 def test_debug_terminal_keeps_aggregate_diagnostics_and_sanitizes_unknown_events():
     messages = []
     terminal = EventTerminal(mode="debug", output=messages.append)
