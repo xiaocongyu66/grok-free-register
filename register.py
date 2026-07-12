@@ -649,6 +649,8 @@ MAX_SOLVER_REUSE = _env_int("MAX_SOLVER_REUSE", 25)
 SOLVER_INITIAL_WAIT_MS = _env_int("SOLVER_INITIAL_WAIT_MS", 500)
 SOLVER_POLL_INTERVAL_MS = _env_int("SOLVER_POLL_INTERVAL_MS", 500)
 SOLVER_POLL_ATTEMPTS = _env_int("SOLVER_POLL_ATTEMPTS", 100)
+SOLVER_HARD_TIMEOUT = max(10, _env_int("SOLVER_HARD_TIMEOUT", 90))
+SOLVER_CLEANUP_TIMEOUT = max(1, _env_int("SOLVER_CLEANUP_TIMEOUT", 5))
 SOLVER_FAST_CLICK = (os.environ.get("SOLVER_FAST_CLICK", "1").strip().lower() not in ("0", "false", "no"))
 SOLVER_MOUSE_CLICK_RETRIES = _env_int("SOLVER_MOUSE_CLICK_RETRIES", 3)
 SOLVER_MOUSE_CLICK_INTERVAL_MS = _env_int("SOLVER_MOUSE_CLICK_INTERVAL_MS", 600)
@@ -815,14 +817,37 @@ async def _put_solver_page(item, ok):
     item["n"] += 1
     if SOLVER_REUSE and ok and item["n"] < MAX_SOLVER_REUSE:
         try:  # 清理本次注入痕迹,留待复用
-            await p.evaluate("document.querySelectorAll('.cf-turnstile').forEach(e=>e.remove());var i=document.querySelector('input[name=\"cf-turnstile-response\"]');if(i)i.remove();")
+            await asyncio.wait_for(
+                p.evaluate("document.querySelectorAll('.cf-turnstile').forEach(e=>e.remove());var i=document.querySelector('input[name=\"cf-turnstile-response\"]');if(i)i.remove();"),
+                timeout=SOLVER_CLEANUP_TIMEOUT,
+            )
             async with _solver_lock:
                 _solver_pool.append(item)
             return
+        except asyncio.CancelledError:
+            await _close_solver_page(item)
+            raise
         except Exception:
             pass
-    try: await p.close()
-    except Exception: pass
+    await _close_solver_page(item)
+
+
+async def _close_solver_page(item):
+    """Bound cleanup so a wedged renderer cannot trap the worker in finally."""
+    page = item["page"]
+    try:
+        await asyncio.wait_for(page.close(), timeout=SOLVER_CLEANUP_TIMEOUT)
+    except asyncio.CancelledError:
+        # Solver cancellation is expected at the hard deadline.  Give cleanup
+        # its own bounded task so the page is not returned to the reuse pool.
+        cleanup = asyncio.create_task(page.close())
+        try:
+            await asyncio.wait_for(cleanup, timeout=SOLVER_CLEANUP_TIMEOUT)
+        except BaseException:
+            cleanup.cancel()
+        raise
+    except Exception:
+        pass
 
 async def _inject_turnstile_widget(p, *, timeline=False):
     if not timeline:
@@ -1518,7 +1543,17 @@ async def s_worker(wid, browser, inventory, physical_sem, t_slot_sem, metrics, a
             trace = {}
             solve_started = time.time()
             try:
-                token, trace = await solve_one_turnstile_with_trace(browser)
+                try:
+                    token, trace = await asyncio.wait_for(
+                        solve_one_turnstile_with_trace(browser),
+                        timeout=SOLVER_HARD_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    debug_log(f'[S] {wid} solver timeout after {SOLVER_HARD_TIMEOUT}s')
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    debug_log(f'[S] {wid} solver error: {type(exc).__name__}: {str(exc)[:80]}')
             finally:
                 solve_elapsed = time.time() - solve_started
                 _record_solver_trace(metrics, trace, solve_elapsed, token)
@@ -1527,6 +1562,9 @@ async def s_worker(wid, browser, inventory, physical_sem, t_slot_sem, metrics, a
 
             if token is None:
                 metrics.t_discarded += 1
+                if t_lease is not None:
+                    await t_lease.release()
+                    t_lease = None
                 await asyncio.sleep(0.5)
                 continue
 
@@ -1551,6 +1589,11 @@ async def s_worker(wid, browser, inventory, physical_sem, t_slot_sem, metrics, a
                 metrics.t_discarded += 1
         except asyncio.CancelledError:
             raise
+        except Exception as exc:
+            # A single browser/page failure must not terminate the permanent
+            # producer.  The next iteration acquires a fresh solver page.
+            metrics.t_discarded += 1
+            debug_log(f'[S] {wid} worker error: {type(exc).__name__}: {str(exc)[:80]}')
         finally:
             if t_lease is not None:
                 await t_lease.release()
@@ -1914,7 +1957,10 @@ async def main():
         f" setCookieViaRequest={'on' if C_SET_COOKIE_VIA_REQUEST else 'off'}"
     )
     debug_log(f"  Workers: S={s_workers} P={p_workers} C={c_workers}")
-    debug_log(f"  Timeouts: P_Request={P_REQUEST_TIMEOUT}s  C_Consume={C_CONSUME_TIMEOUT}s")
+    debug_log(
+        f"  Timeouts: Solver={SOLVER_HARD_TIMEOUT}s SolverCleanup={SOLVER_CLEANUP_TIMEOUT}s "
+        f"P_Request={P_REQUEST_TIMEOUT}s C_Consume={C_CONSUME_TIMEOUT}s"
+    )
     debug_log(
         f"  SolverMouseClick: retries={SOLVER_MOUSE_CLICK_RETRIES} "
         f"interval={SOLVER_MOUSE_CLICK_INTERVAL_MS}ms"
