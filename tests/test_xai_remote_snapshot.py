@@ -66,6 +66,7 @@ def test_snapshot_sync_atomically_replaces_only_valid_complete_export(tmp_path):
             "host",
             destination,
             process_factory=invalid_factory,
+            fingerprint=lambda source_id: f"key:{source_id}",
         )
         assert not await synchronizer.sync_once()
         assert destination.read_bytes() == _document("old") + b"\n"
@@ -95,9 +96,18 @@ def test_snapshot_sync_atomically_replaces_only_valid_complete_export(tmp_path):
 
         synchronizer.process_factory = valid_factory
         assert await synchronizer.sync_once()
+        assert synchronizer.snapshot_fingerprints == frozenset(
+            {"key:new-a", "key:new-b"}
+        )
         assert destination.read_bytes() == _document("new-a") + b"\n" + _document("new-b") + b"\n"
         assert destination.stat().st_mode & 0o777 == 0o600
         assert not list(tmp_path.glob(".source-snapshot.jsonl.*.tmp"))
+
+        synchronizer.process_factory = invalid_factory
+        assert not await synchronizer.sync_once()
+        assert synchronizer.snapshot_fingerprints == frozenset(
+            {"key:new-a", "key:new-b"}
+        )
 
     asyncio.run(scenario())
 
@@ -120,5 +130,45 @@ def test_snapshot_consumer_finishes_open_generation_before_replacement(tmp_path)
         assert (await asyncio.wait_for(anext(records), 1)).source_id == "new-a"
         await source.close()
         await records.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_source_reports_only_aggregate_new_records(tmp_path):
+    class Synchronizer:
+        def __init__(self):
+            self.snapshot_fingerprints = None
+            self.calls = 0
+            self.source = None
+
+        async def sync_once(self):
+            self.calls += 1
+            if self.calls == 1:
+                self.snapshot_fingerprints = frozenset({"a", "b"})
+            else:
+                self.snapshot_fingerprints = frozenset({"a", "b", "c"})
+                self.source._closed = True
+            return True
+
+        async def close(self):
+            return None
+
+    async def scenario():
+        synchronizer = Synchronizer()
+        events = []
+        source = DiskSnapshotSource(
+            tmp_path / "source-snapshot.jsonl",
+            synchronizer=synchronizer,
+            sync_seconds=0.001,
+            event_callback=lambda kind, data: events.append((kind, data)),
+        )
+        synchronizer.source = source
+
+        await source._sync_loop()
+
+        assert events == [
+            ("source_connected", {}),
+            ("source_updated", {"new": 1, "total": 3}),
+        ]
 
     asyncio.run(scenario())

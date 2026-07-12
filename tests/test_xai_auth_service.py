@@ -1,8 +1,11 @@
 import asyncio
+import os
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from xai_enroller.models import JobResult, JobStatus, SourceRecord
 from xai_enroller.service import (
@@ -10,11 +13,175 @@ from xai_enroller.service import (
     AuthServiceRunner,
     AuthServiceSettings,
     AuthPipelineRunner,
+    EventTerminal,
     SSHRegisteredSource,
     parse_registered_accounts,
+    resolve_auth_log_mode,
 )
 from xai_enroller.ledger import Ledger
 from xai_enroller.inventory import InventoryError
+
+
+def test_auth_log_mode_prefers_cli_and_rejects_invalid_values():
+    assert resolve_auth_log_mode([], {}) == "user"
+    assert resolve_auth_log_mode(
+        [], {"XAI_AUTH_SERVICE_LOG_MODE": "debug"}
+    ) == "debug"
+    assert resolve_auth_log_mode(
+        ["--debug"], {"XAI_AUTH_SERVICE_LOG_MODE": "user"}
+    ) == "debug"
+    with pytest.raises(ValueError, match="XAI_AUTH_SERVICE_LOG_MODE"):
+        resolve_auth_log_mode([], {"XAI_AUTH_SERVICE_LOG_MODE": "verbose"})
+
+
+def test_user_terminal_reports_progress_without_internal_or_secret_fields():
+    messages = []
+    terminal = EventTerminal(mode="user", output=messages.append)
+    terminal.emit(
+        (
+            "startup",
+            {
+                "available": 7,
+                "claimed": 3,
+                "destination": "authenticated/",
+                "ssh_host": "do-not-print.example",
+            },
+        )
+    )
+    terminal.emit(
+        (
+            "authorization_started",
+            {
+                "task_number": 3,
+                "attempt_number": 1,
+                "pending_total": 41,
+                "source_queue": 64,
+                "source_id": "secret@example.test",
+            },
+        )
+    )
+    terminal.emit(
+        (
+            "result",
+            {
+                "status": "imported",
+                "reason": "imported",
+                "task_number": 3,
+                "five_minute_imports_per_minute": 4.25,
+                "imported_unique": 120,
+                "available": 117,
+                "source_id": "secret@example.test",
+            },
+        )
+    )
+
+    assert messages == [
+        "[✓] 本地认证服务已启动 | 来源 等待同步 | 输出 authenticated/ | 待处理 — | 可用 7",
+        "[→] 开始认证 #3 | 待处理 41",
+        "[✓] 认证成功 #3 | 近5分钟 4.25/分 | 累计 120 | 可用 117",
+    ]
+    rendered = "\n".join(messages)
+    assert "source_queue" not in rendered
+    assert "secret@example.test" not in rendered
+    assert "do-not-print.example" not in rendered
+
+
+def test_user_status_distinguishes_unknown_rate_from_zero_rate():
+    base = {
+        "state": "running",
+        "pending_total": None,
+        "active_stage": "idle",
+        "imported_unique": 0,
+        "available": 0,
+        "claimed": 0,
+        "cooldown": False,
+    }
+    messages = []
+    terminal = EventTerminal(mode="user", output=messages.append)
+    terminal.emit(("status", {**base, "five_minute_imports_per_minute": None}))
+    terminal.emit(("status", {**base, "five_minute_imports_per_minute": 0.0}))
+
+    assert "近5分钟 —" in messages[0]
+    assert "近5分钟 0.00/分" in messages[1]
+    assert "source_queue" not in messages[0]
+
+
+def test_debug_terminal_keeps_aggregate_diagnostics_and_sanitizes_unknown_events():
+    messages = []
+    terminal = EventTerminal(mode="debug", output=messages.append)
+    terminal.emit(
+        (
+            "status",
+            {
+                "state": "running",
+                "source_queue": 2,
+                "prepared_queue": 1,
+                "completion_queue": 0,
+                "active_stage": "authorization",
+                "retry_waiting": 1,
+                "next_retry_seconds": 5.0,
+                "authorization_starts": 3,
+                "cooldown": False,
+                "cooldown_remaining_seconds": 0.0,
+                "probe_in_flight": False,
+                "min_authorization_interval_seconds": 10.0,
+                "pacing_remaining_seconds": 2.0,
+                "imported_unique": 2,
+                "attempted_unique": 3,
+                "rate_limited": 1,
+                "five_minute_imports_per_minute": 2.0,
+                "lifetime_imports_per_minute": 1.0,
+                "available": 2,
+                "claiming": 0,
+                "claimed": 0,
+            },
+        )
+    )
+    terminal.emit(
+        (
+            "future_event",
+            {"reason": "internal_error", "token": "do-not-print-token"},
+        )
+    )
+
+    assert "queues=2/1/0" in messages[0]
+    assert messages[1] == "• debug event=future_event reason=internal_error"
+    assert "do-not-print-token" not in "\n".join(messages)
+
+
+def test_terminal_output_failure_does_not_escape():
+    def broken_output(_message):
+        raise OSError("closed terminal")
+
+    terminal = EventTerminal(mode="user", output=broken_output)
+    terminal.emit(("service_stopped", {}))
+
+
+def test_auth_service_configuration_errors_are_actionable_without_traceback():
+    environment = os.environ.copy()
+    environment.pop("XAI_AUTH_SERVICE_SSH_HOST", None)
+    environment.pop("XAI_AUTH_SERVICE_LOG_MODE", None)
+    missing = subprocess.run(
+        [sys.executable, "-m", "xai_enroller.service"],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert missing.returncode == 2
+    assert "XAI_AUTH_SERVICE_SSH_HOST" in missing.stderr
+    assert "docs/guides/auth-service.md" in missing.stderr
+    assert "Traceback" not in missing.stderr
+
+    environment["XAI_AUTH_SERVICE_LOG_MODE"] = "verbose"
+    invalid = subprocess.run(
+        [sys.executable, "-m", "xai_enroller.service"],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert invalid.returncode == 2
+    assert "XAI_AUTH_SERVICE_LOG_MODE" in invalid.stderr
+    assert "Traceback" not in invalid.stderr
 
 
 def test_registered_account_parser_keeps_only_email_and_sso():

@@ -533,12 +533,14 @@ class AuthPipeline:
             self.start_interval.mark_started()
             self.ledger.mark_authorization_started(prepared.job_id)
             self._authorization_starts += 1
+            prepared = replace(prepared, task_number=self._authorization_starts)
             self._emit(
                 "authorization_started",
                 {
                     "task_number": self._authorization_starts,
                     "attempt_number": prepared.attempt_number,
                     "source_queue": self.source_queue.qsize(),
+                    "pending_total": self._pending_total(),
                 },
             )
             async with asyncio.timeout(self.timeout):
@@ -571,6 +573,7 @@ class AuthPipeline:
                     JobStatus.NEEDS_INTERACTION,
                     "rate_limited",
                     retry="rate_limited",
+                    task_number=prepared.task_number,
                 )
                 return
 
@@ -596,6 +599,7 @@ class AuthPipeline:
                 status,
                 authorization.reason_code,
                 retry=transient,
+                task_number=prepared.task_number,
             )
         except asyncio.CancelledError:
             self._authorization_cancellable = False
@@ -608,7 +612,12 @@ class AuthPipeline:
                     prepared.source_fingerprint,
                     self.CANCEL_RETRY_DELAY,
                 )
-                self._emit_result(JobStatus.CANCELLED, reason, prepared.attempt_number)
+                self._emit_result(
+                    JobStatus.CANCELLED,
+                    reason,
+                    prepared.attempt_number,
+                    prepared.task_number,
+                )
             raise
         except TimeoutError:
             self._authorization_cancellable = False
@@ -621,6 +630,7 @@ class AuthPipeline:
                 JobStatus.TIMEOUT,
                 "confirmation_timeout",
                 retry=True,
+                task_number=prepared.task_number,
             )
         except (httpx.TransportError, OSError):
             self._authorization_cancellable = False
@@ -633,6 +643,7 @@ class AuthPipeline:
                 JobStatus.TRANSPORT_FAILED,
                 "authorization_transport_failed",
                 retry=True,
+                task_number=prepared.task_number,
             )
         except Exception:
             self._authorization_cancellable = False
@@ -645,6 +656,7 @@ class AuthPipeline:
                 JobStatus.NEEDS_INTERACTION,
                 "browser_error",
                 retry=True,
+                task_number=prepared.task_number,
             )
         finally:
             self._authorization_cancellable = False
@@ -696,6 +708,7 @@ class AuthPipeline:
                     status,
                     reason,
                     retry=False,
+                    task_number=prepared.task_number,
                 )
             else:
                 await self._finish_failure(
@@ -706,6 +719,7 @@ class AuthPipeline:
                     JobStatus.TRANSPORT_FAILED,
                     "token_transport_failed",
                     retry=True,
+                    task_number=prepared.task_number,
                 )
             return
         except (httpx.TransportError, OSError, TimeoutError):
@@ -718,6 +732,7 @@ class AuthPipeline:
                 JobStatus.TRANSPORT_FAILED,
                 "token_transport_failed",
                 retry=True,
+                task_number=prepared.task_number,
             )
             return
         except Exception:
@@ -730,6 +745,7 @@ class AuthPipeline:
                 JobStatus.TRANSPORT_FAILED,
                 "token_failed",
                 retry=True,
+                task_number=prepared.task_number,
             )
             return
 
@@ -743,6 +759,7 @@ class AuthPipeline:
                 JobStatus.SINK_FAILED,
                 "sink_unconfigured",
                 retry=False,
+                task_number=prepared.task_number,
             )
             return
         # Sink persistence and the matching ledger transition form one commit.
@@ -767,6 +784,7 @@ class AuthPipeline:
                 JobStatus.SINK_FAILED,
                 "sink_failed",
                 retry=True,
+                task_number=prepared.task_number,
             )
             return
 
@@ -781,7 +799,12 @@ class AuthPipeline:
         self._transient_retries.pop(prepared.source_fingerprint, None)
         self._process_imports += 1
         self._recent_imports.append(self._clock())
-        self._emit_result(JobStatus.IMPORTED, "imported", prepared.attempt_number)
+        self._emit_result(
+            JobStatus.IMPORTED,
+            "imported",
+            prepared.attempt_number,
+            prepared.task_number,
+        )
         if cancelled_during_commit:
             raise asyncio.CancelledError
 
@@ -794,7 +817,12 @@ class AuthPipeline:
                 prepared.source_fingerprint,
                 self.CANCEL_RETRY_DELAY,
             )
-            self._emit_result(JobStatus.CANCELLED, reason, prepared.attempt_number)
+            self._emit_result(
+                JobStatus.CANCELLED,
+                reason,
+                prepared.attempt_number,
+                prepared.task_number,
+            )
 
     async def _finish_failure(
         self,
@@ -806,6 +834,7 @@ class AuthPipeline:
         reason,
         *,
         retry,
+        task_number=None,
     ):
         self.ledger.finish(job_id, status, reason)
         if retry == "rate_limited":
@@ -823,7 +852,7 @@ class AuthPipeline:
                 self._set_state(fingerprint, PipelineState.TERMINAL)
         else:
             self._set_state(fingerprint, PipelineState.TERMINAL)
-        self._emit_result(status, reason, attempt)
+        self._emit_result(status, reason, attempt, task_number)
 
     def _prune_recent_imports(self):
         cutoff = self._clock() - 300.0
@@ -839,6 +868,7 @@ class AuthPipeline:
         attempted_unique = counts["attempted_unique"]
         return {
             **counts,
+            **self.ledger.inventory_counts(),
             "attempt_success": (
                 counts["imported_attempts"] / finalized if finalized else 0.0
             ),
@@ -847,13 +877,22 @@ class AuthPipeline:
                 if attempted_unique
                 else 0.0
             ),
-            "five_minute_imports_per_minute": len(self._recent_imports)
-            * 60.0
-            / rolling_window,
+            "five_minute_imports_per_minute": (
+                len(self._recent_imports) * 60.0 / rolling_window
+                if self._process_imports
+                else None
+            ),
             "lifetime_imports_per_minute": self._process_imports * 60.0 / elapsed,
+            "pending_total": self._pending_total(),
         }
 
-    def _emit_result(self, status, reason, attempt):
+    def _pending_total(self):
+        snapshot = getattr(self.source, "snapshot_fingerprints", None)
+        if snapshot is None:
+            return None
+        return len(snapshot - self.ledger.imported_fingerprints())
+
+    def _emit_result(self, status, reason, attempt, task_number=None):
         try:
             metrics = self._metrics()
         except Exception:
@@ -868,6 +907,7 @@ class AuthPipeline:
                 "status": status.value,
                 "reason": reason,
                 "attempt_number": attempt,
+                "task_number": task_number,
                 **metrics,
             },
         )

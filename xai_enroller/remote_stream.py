@@ -30,12 +30,15 @@ class SSHSnapshotSynchronizer:
         remote_root="/opt/grok-free-register",
         identity_file=None,
         process_factory=asyncio.create_subprocess_exec,
+        fingerprint=None,
     ):
         self.host = host
         self.destination = Path(destination)
         self.remote_root = remote_root
         self.identity_file = identity_file
         self.process_factory = process_factory
+        self.fingerprint = fingerprint or (lambda source_id: source_id)
+        self.snapshot_fingerprints = None
         self._process = None
 
     def _command(self):
@@ -109,6 +112,7 @@ class SSHSnapshotSynchronizer:
             with os.fdopen(fd, "wb") as stream:
                 fd = -1
                 record_count = 0
+                snapshot_fingerprints = set()
                 while True:
                     try:
                         raw = await process.stdout.readline()
@@ -121,7 +125,8 @@ class SSHSnapshotSynchronizer:
                         or len(raw) - 1 > MAX_SESSION_RECORD_BYTES
                     ):
                         raise ValueError("invalid remote session snapshot")
-                    parse_session_document(raw[:-1])
+                    record = parse_session_document(raw[:-1])
+                    snapshot_fingerprints.add(self.fingerprint(record.source_id))
                     stream.write(raw)
                     record_count += 1
                 returncode = await process.wait()
@@ -141,6 +146,7 @@ class SSHSnapshotSynchronizer:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+            self.snapshot_fingerprints = frozenset(snapshot_fingerprints)
             return True
         except asyncio.CancelledError:
             raise
@@ -173,6 +179,7 @@ class DiskSnapshotSource:
         poll_seconds=0.25,
         sleep=asyncio.sleep,
         event_callback=None,
+        fingerprint=None,
     ):
         self.path = Path(path)
         self.synchronizer = synchronizer
@@ -180,6 +187,9 @@ class DiskSnapshotSource:
         self.poll_seconds = float(poll_seconds)
         self.sleep = sleep
         self.event_callback = event_callback
+        self.fingerprint = fingerprint or (lambda source_id: source_id)
+        self._snapshot_fingerprints = None
+        self._last_reported_snapshot_fingerprints = None
         self._closed = False
         self._sync_task = None
         self._last_sync_ok = None
@@ -189,15 +199,32 @@ class DiskSnapshotSource:
             with suppress(Exception):
                 self.event_callback(kind, data)
 
+    @property
+    def snapshot_fingerprints(self):
+        if self.synchronizer is not None:
+            return self.synchronizer.snapshot_fingerprints
+        return self._snapshot_fingerprints
+
     async def _sync_loop(self):
         while not self._closed:
             refreshed = await self.synchronizer.sync_once()
+            current = self.synchronizer.snapshot_fingerprints
             if refreshed != self._last_sync_ok:
                 self._emit(
                     "source_connected" if refreshed else "source_disconnected",
                     {} if refreshed else {"reason": "snapshot_sync_failed"},
                 )
                 self._last_sync_ok = refreshed
+            if refreshed and current is not None:
+                previous = self._last_reported_snapshot_fingerprints
+                if previous is not None:
+                    added = current - previous
+                    if added:
+                        self._emit(
+                            "source_updated",
+                            {"new": len(added), "total": len(current)},
+                        )
+                self._last_reported_snapshot_fingerprints = current
             try:
                 await asyncio.wait_for(self._wait_closed(), timeout=self.sync_seconds)
             except TimeoutError:
@@ -246,6 +273,8 @@ class DiskSnapshotSource:
                 continue
             with stream:
                 opened_generation = self._generation(os.fstat(stream.fileno()))
+                generation_fingerprints = set()
+                valid_generation = True
                 while not self._closed:
                     raw = await asyncio.to_thread(
                         stream.readline, MAX_SESSION_RECORD_BYTES + 2
@@ -259,6 +288,7 @@ class DiskSnapshotSource:
                         self._emit(
                             "source_record_rejected", {"reason": "invalid_record"}
                         )
+                        valid_generation = False
                         break
                     try:
                         record = parse_session_document(raw[:-1])
@@ -266,8 +296,12 @@ class DiskSnapshotSource:
                         self._emit(
                             "source_record_rejected", {"reason": "invalid_record"}
                         )
+                        valid_generation = False
                         continue
+                    generation_fingerprints.add(self.fingerprint(record.source_id))
                     yield record
+            if valid_generation:
+                self._snapshot_fingerprints = frozenset(generation_fingerprints)
             consumed_generation = opened_generation
 
 

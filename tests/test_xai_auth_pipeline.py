@@ -127,6 +127,7 @@ def test_sink_and_ledger_commit_cannot_be_cancelled_mid_commit(tmp_path):
         executor = ImmediateExecutor()
         sink = BlockingThreadSink()
         ledger = Ledger(tmp_path / "ledger.db", b"salt")
+        events = []
         pipeline = AuthPipeline(
             source=SingleSource(),
             protocol=ImmediateProtocol(),
@@ -134,6 +135,7 @@ def test_sink_and_ledger_commit_cannot_be_cancelled_mid_commit(tmp_path):
             sink=sink,
             ledger=ledger,
             timeout=2,
+            event_callback=lambda kind, data: events.append((kind, data)),
         )
         sink.pipeline = pipeline
         run = asyncio.create_task(pipeline.run())
@@ -144,8 +146,42 @@ def test_sink_and_ledger_commit_cannot_be_cancelled_mid_commit(tmp_path):
         assert executor.calls == 1
         assert sink.calls == 1
         assert ledger.aggregate_counts()["imported_unique"] == 1
+        started = next(data for kind, data in events if kind == "authorization_started")
+        imported = next(
+            data
+            for kind, data in events
+            if kind == "result" and data["status"] == "imported"
+        )
+        assert imported["task_number"] == started["task_number"]
 
     asyncio.run(scenario())
+
+
+def test_pending_total_uses_current_snapshot_set_difference(tmp_path):
+    class SnapshotSource(EmptySource):
+        snapshot_fingerprints = frozenset({"a", "b", "c"})
+
+    ledger = Ledger(tmp_path / "ledger.db", b"salt")
+    imported = ledger.start_fingerprint("b")
+    ledger.finish(imported, JobStatus.IMPORTED, "imported", "receipt-b")
+    outside = ledger.start_fingerprint("outside")
+    ledger.finish(outside, JobStatus.IMPORTED, "imported", "receipt-outside")
+    pipeline = AuthPipeline(
+        source=SnapshotSource(),
+        protocol=object(),
+        executor=NoopExecutor(),
+        sink=object(),
+        ledger=ledger,
+    )
+
+    assert pipeline.status()["pending_total"] == 2
+    assert pipeline.status()["five_minute_imports_per_minute"] is None
+
+
+def test_pending_total_is_unknown_before_first_valid_snapshot(tmp_path):
+    pipeline = _pipeline(tmp_path)
+
+    assert pipeline.status()["pending_total"] is None
 
 
 def test_queued_source_imported_while_paused_is_not_authorized(tmp_path):

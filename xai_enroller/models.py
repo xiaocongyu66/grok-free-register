@@ -108,6 +108,7 @@ class PreparedJob:
     flow_created_monotonic: float
     job_id: int
     attempt_number: int
+    task_number: Optional[int] = None
 
     def __repr__(self) -> str:
         return (

@@ -20,6 +20,28 @@ AUTHENTICATED_DIRNAME = "authenticated"
 CLAIMED_DIRNAME = "claimed"
 
 
+class AuthServiceConfigurationError(ValueError):
+    pass
+
+
+def resolve_auth_log_mode(argv=None, env=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    env = dict(os.environ if env is None else env)
+    unknown = [argument for argument in argv if argument != "--debug"]
+    if unknown:
+        raise AuthServiceConfigurationError(
+            f"unsupported auth service argument: {unknown[0]}"
+        )
+    mode = (env.get("XAI_AUTH_SERVICE_LOG_MODE") or "user").strip().lower()
+    if "--debug" in argv:
+        mode = "debug"
+    if mode not in {"user", "debug"}:
+        raise AuthServiceConfigurationError(
+            "XAI_AUTH_SERVICE_LOG_MODE must be user or debug"
+        )
+    return mode
+
+
 def prepare_local_service_environment(env=None):
     """Create private local persistence defaults without storing secrets in the repo."""
     merged = dict(os.environ if env is None else env)
@@ -71,7 +93,9 @@ class AuthServiceSettings:
         env = dict(os.environ if env is None else env)
         ssh_host = (env.get("XAI_AUTH_SERVICE_SSH_HOST") or "").strip()
         if not ssh_host:
-            raise ValueError("XAI_AUTH_SERVICE_SSH_HOST is required")
+            raise AuthServiceConfigurationError(
+                "XAI_AUTH_SERVICE_SSH_HOST is required"
+            )
         remote_root = (
             env.get("XAI_AUTH_SERVICE_REMOTE_ROOT") or "/opt/grok-free-register"
         ).strip()
@@ -83,13 +107,19 @@ class AuthServiceSettings:
                 env.get("XAI_AUTH_SERVICE_MIN_INTERVAL_SEC", "10")
             )
         except ValueError as exc:
-            raise ValueError("auth service intervals must be numeric") from exc
+            raise AuthServiceConfigurationError(
+                "auth service intervals must be numeric"
+            ) from exc
         if not 5 <= sync_seconds <= 3600:
-            raise ValueError("XAI_AUTH_SERVICE_SYNC_SEC must be between 5 and 3600")
+            raise AuthServiceConfigurationError(
+                "XAI_AUTH_SERVICE_SYNC_SEC must be between 5 and 3600"
+            )
         if not 30 <= retry_seconds <= 86400:
-            raise ValueError("XAI_AUTH_SERVICE_RETRY_SEC must be between 30 and 86400")
+            raise AuthServiceConfigurationError(
+                "XAI_AUTH_SERVICE_RETRY_SEC must be between 30 and 86400"
+            )
         if not 0 <= min_authorization_interval_seconds <= 3600:
-            raise ValueError(
+            raise AuthServiceConfigurationError(
                 "XAI_AUTH_SERVICE_MIN_INTERVAL_SEC must be between 0 and 3600"
             )
         return cls(
@@ -223,65 +253,200 @@ class AuthService:
 
 
 class EventTerminal:
-    """Render only aggregate, classified events; identifiers and credentials stay hidden."""
+    """Mode-aware aggregate renderer; identifiers and credentials stay hidden."""
+
+    _SAFE_REASONS = {
+        "already_imported",
+        "authorization_transport_failed",
+        "browser_error",
+        "challenge_required",
+        "confirmation_timeout",
+        "device_flow_failed",
+        "device_flow_invalid",
+        "device_flow_refresh_failed",
+        "imported",
+        "internal_error",
+        "oauth_denied",
+        "oauth_expired",
+        "oauth_rejected",
+        "operator_cancelled",
+        "rate_limited",
+        "sink_failed",
+        "sink_unconfigured",
+        "snapshot_sync_failed",
+        "token_failed",
+        "token_transport_failed",
+        "unknown_page",
+    }
+    _TRANSIENT_REASONS = {
+        "authorization_transport_failed",
+        "browser_error",
+        "challenge_required",
+        "confirmation_timeout",
+        "device_flow_failed",
+        "device_flow_refresh_failed",
+        "sink_failed",
+        "token_failed",
+        "token_transport_failed",
+        "unknown_page",
+    }
+
+    def __init__(self, mode="user", output=None):
+        if mode not in {"user", "debug"}:
+            raise ValueError("terminal mode must be user or debug")
+        self.mode = mode
+        self.output = output or self._print
+
+    @staticmethod
+    def _print(message):
+        print(message, flush=True)
 
     @staticmethod
     def _percentage(value):
         return f"{100.0 * float(value):.1f}%"
 
-    def emit(self, event):
-        kind, data = event
-        message = None
+    @staticmethod
+    def _rate(value):
+        return "—" if value is None else f"{float(value):.2f}/分"
+
+    @staticmethod
+    def _pending(value):
+        return "—" if value is None else str(value)
+
+    def _format_user(self, kind, data):
+        if kind == "startup":
+            return (
+                "[✓] 本地认证服务已启动 | 来源 等待同步 | "
+                f"输出 {data['destination']} | 待处理 — | 可用 {data['available']}"
+            )
         if kind == "service_started":
-            message = (
+            return "[▶] 认证流水线运行中"
+        if kind == "service_stopped":
+            return "[■] 认证服务已停止"
+        if kind == "source_connected":
+            return "[✓] 账号来源已连接 | 本地快照可用"
+        if kind == "source_updated":
+            return f"[↻] 发现新账号 {data['new']} | 快照共 {data['total']}"
+        if kind == "source_disconnected":
+            return "[!] 账号来源暂时断开 | 继续使用上一份有效快照"
+        if kind == "source_record_rejected":
+            return "[!] 已忽略一条无效来源记录"
+        if kind == "rate_limited":
+            return f"[⏸] 触发限流 | {data['wait_seconds']}秒后单次探测"
+        if kind == "rate_limit_cleared":
+            return f"[▶] 限流解除 | 实际等待 {data['elapsed_seconds']}秒"
+        if kind == "authorization_started":
+            return (
+                f"[→] 开始认证 #{data['task_number']} | "
+                f"待处理 {self._pending(data.get('pending_total'))}"
+            )
+        if kind == "result":
+            if data.get("status") == "imported":
+                return (
+                    f"[✓] 认证成功 #{data.get('task_number', '—')} | "
+                    f"近5分钟 {self._rate(data.get('five_minute_imports_per_minute'))} | "
+                    f"累计 {data['imported_unique']} | 可用 {data.get('available', '—')}"
+                )
+            reason = data.get("reason")
+            if reason == "rate_limited":
+                return None
+            action = "暂时失败，将自动重试" if reason in self._TRANSIENT_REASONS else "已跳过"
+            return f"[✗] 认证未完成 #{data.get('task_number', '—')} | {action}"
+        if kind == "control":
+            states = {
+                "paused": "[⏸] 认证服务已暂停",
+                "running": "[▶] 认证服务已恢复",
+                "cancelling": "[■] 正在取消当前任务",
+                "idle": "[•] 当前没有可取消的任务",
+                "stopping": "[■] 正在安全退出",
+            }
+            return states.get(data.get("state"), "[•] 控制命令已处理")
+        if kind == "status":
+            state = {"running": "运行中", "paused": "已暂停", "stopping": "停止中"}.get(
+                data.get("state"), "未知"
+            )
+            cooldown = (
+                f"限流冷却 {data.get('cooldown_remaining_seconds', 0):.0f}秒"
+                if data.get("cooldown")
+                else "不限流"
+            )
+            return (
+                f"[•] 状态 {state} | 待处理 {self._pending(data.get('pending_total'))} | "
+                f"阶段 {data.get('active_stage', 'idle')} | "
+                f"近5分钟 {self._rate(data.get('five_minute_imports_per_minute'))} | "
+                f"累计 {data.get('imported_unique', 0)} | "
+                f"可用 {data.get('available', 0)} | 已取用 {data.get('claimed', 0)} | {cooldown}"
+            )
+        if kind == "inventory_taken":
+            return (
+                f"[✓] 已取用 {data['moved']} 个凭据 | "
+                f"可用 {data['available']} | 批次 {data['batch_id']}"
+            )
+        if kind == "inventory_error":
+            return (
+                f"[!] 凭据取用失败 | 可用 {data['available']} | "
+                f"处理中 {data['claiming']} | 已取用 {data['claimed']}"
+            )
+        if kind == "pipeline_error":
+            return f"[!] 认证流水线异常 | 阶段 {data.get('stage', 'unknown')}"
+        return None
+
+    def _format_debug(self, kind, data):
+        if kind == "service_started":
+            return (
                 "• service: running; "
                 f"min_interval={data['min_authorization_interval_seconds']:.1f}s"
             )
-        elif kind == "service_stopped":
-            message = "• service: stopped"
-        elif kind == "source_connected":
-            message = "• source: local snapshot updated"
-        elif kind == "source_disconnected":
-            message = f"⚠ source: {data['reason']}; keeping previous snapshot"
-        elif kind == "source_record_rejected":
-            message = "⚠ source: invalid record rejected"
-        elif kind == "rate_limited":
-            message = (
+        if kind == "service_stopped":
+            return "• service: stopped"
+        if kind == "source_connected":
+            return "• source: local snapshot updated"
+        if kind == "source_updated":
+            return f"• source: new={data['new']}; total={data['total']}"
+        if kind == "source_disconnected":
+            return "⚠ source: snapshot_sync_failed; keeping previous snapshot"
+        if kind == "source_record_rejected":
+            return "⚠ source: invalid record rejected"
+        if kind == "rate_limited":
+            return (
                 "⏸ authentication rate limited; "
                 f"next single probe in {data['wait_seconds']}s"
             )
-        elif kind == "rate_limit_cleared":
-            message = (
+        if kind == "rate_limit_cleared":
+            return (
                 "▶ authentication rate limit cleared after "
                 f"{data['elapsed_seconds']}s"
             )
-        elif kind == "authorization_started":
-            message = (
+        if kind == "authorization_started":
+            return (
                 "→ authentication: next task started; "
                 f"task={data['task_number']}; attempt={data['attempt_number']}; "
-                f"queued={data['source_queue']}"
+                f"queued={data['source_queue']}; "
+                f"pending={self._pending(data.get('pending_total'))}"
             )
-        elif kind == "result":
-            if data["status"] == "imported":
-                message = (
+        if kind == "result":
+            if data.get("status") == "imported":
+                return (
                     "✓ authentication: imported; "
-                    f"total={data['imported_unique']}, "
-                    f"avg_rate={data['lifetime_imports_per_minute']:.2f}/min, "
-                    f"attempt_success={self._percentage(data['attempt_success'])}, "
+                    f"task={data.get('task_number')}; total={data['imported_unique']}; "
+                    f"5m_rate={self._rate(data.get('five_minute_imports_per_minute'))}; "
+                    f"attempt_success={self._percentage(data['attempt_success'])}; "
                     f"eventual_success={self._percentage(data['eventual_success'])}"
                 )
-            elif data["reason"] == "rate_limited":
-                message = None
-            else:
-                message = (
-                    f"⚠ authentication: {data['status']} ({data['reason']}); "
-                    f"attempt={data['attempt_number']}; "
-                    f"avg_rate={data['lifetime_imports_per_minute']:.2f}/min"
-                )
-        elif kind == "control":
-            message = f"• service: {data['state']}"
-        elif kind == "status":
-            message = (
+            reason = data.get("reason")
+            safe_reason = reason if reason in self._SAFE_REASONS else "unknown"
+            return (
+                f"⚠ authentication: {data.get('status', 'unknown')} ({safe_reason}); "
+                f"task={data.get('task_number')}; attempt={data.get('attempt_number')}"
+            )
+        if kind == "control":
+            state = data.get("state", "unknown")
+            safe_state = state if str(state).replace(" ", "").isalnum() else "unknown"
+            return f"• service: {safe_state}"
+        if kind == "status":
+            rate = data.get("five_minute_imports_per_minute")
+            rate_text = "unknown" if rate is None else f"{rate:.2f}/min"
+            return (
                 f"• status: {data['state']}; "
                 f"queues={data['source_queue']}/{data['prepared_queue']}/"
                 f"{data['completion_queue']}; active={data['active_stage']}; "
@@ -293,32 +458,48 @@ class EventTerminal:
                 f"probe={str(data['probe_in_flight']).lower()}; "
                 f"min_interval={data['min_authorization_interval_seconds']:.1f}s; "
                 f"pace_remaining={data['pacing_remaining_seconds']:.1f}s; "
-                f"imported={data['imported_unique']}; "
-                f"attempted={data['attempted_unique']}; "
-                f"rate_limited={data['rate_limited']}; "
-                f"5m_rate={data['five_minute_imports_per_minute']:.2f}/min; "
+                f"imported={data['imported_unique']}; attempted={data['attempted_unique']}; "
+                f"rate_limited={data['rate_limited']}; 5m_rate={rate_text}; "
                 f"lifetime_rate={data['lifetime_imports_per_minute']:.2f}/min; "
-                f"available={data['available']}; "
-                f"claiming={data['claiming']}; claimed={data['claimed']}"
+                f"available={data['available']}; claiming={data['claiming']}; "
+                f"claimed={data['claimed']}"
             )
-        elif kind == "inventory_taken":
-            message = (
+        if kind == "inventory_taken":
+            return (
                 f"✓ inventory: claimed={data['moved']}; "
-                f"available={data['available']}; batch={data['batch_id']}; "
-                f"directory={data['directory']}"
+                f"available={data['available']}; batch={data['batch_id']}"
             )
-        elif kind == "inventory_error":
-            message = (
-                f"⚠ inventory: {data['reason']}; "
-                f"available={data['available']}; "
+        if kind == "inventory_error":
+            return (
+                f"⚠ inventory: available={data['available']}; "
                 f"claiming={data['claiming']}; claimed={data['claimed']}"
             )
-        elif kind == "pipeline_error":
+        if kind == "pipeline_error":
+            reason = data.get("reason")
+            safe_reason = reason if reason in self._SAFE_REASONS else "unknown"
+            stage = data.get("stage", "unknown")
+            safe_stage = stage if str(stage).replace("_", "").isalnum() else "unknown"
+            return f"⚠ service: {safe_stage} stage stopped ({safe_reason})"
+        known = self._format_user(kind, data)
+        if known is not None:
+            return known
+        reason = data.get("reason")
+        suffix = f" reason={reason}" if reason in self._SAFE_REASONS else ""
+        safe_kind = kind if kind.replace("_", "").isalnum() else "unknown"
+        return f"• debug event={safe_kind}{suffix}"
+
+    def emit(self, event):
+        kind, data = event
+        try:
             message = (
-                f"⚠ service: {data['stage']} stage stopped ({data['reason']})"
+                self._format_debug(kind, data)
+                if self.mode == "debug"
+                else self._format_user(kind, data)
             )
-        if message is not None:
-            print(message, flush=True)
+            if message is not None:
+                self.output(message)
+        except Exception:
+            return
 
 
 class AuthPipelineRunner:
@@ -474,11 +655,13 @@ class AuthServiceRunner:
 
 
 async def _run_interactive(runner):
-    print(
-        "commands: s=status, take N=claim credentials, p=pause, "
-        "r=resume, c=cancel active, q=quit",
-        flush=True,
-    )
+    try:
+        print(
+            "命令：s 状态 | take N 取用凭据 | p 暂停 | r 恢复 | c 取消当前任务 | q 退出",
+            flush=True,
+        )
+    except OSError:
+        pass
     loop = asyncio.get_running_loop()
     commands = asyncio.Queue()
     stdin_fd = sys.stdin.fileno()
@@ -519,7 +702,7 @@ async def _run_interactive(runner):
         await asyncio.gather(worker, return_exceptions=True)
 
 
-async def main_async():
+async def main_async(*, log_mode="user"):
     import httpx
 
     from .auth_pipeline import AuthPipeline
@@ -537,22 +720,25 @@ async def main_async():
     merged["XAI_ENROLLER_AUTH_EXECUTOR"] = "playwright"
     merged["XAI_ENROLLER_CONCURRENCY"] = "1"
     settings = Settings.from_environ(merged)
-    terminal = EventTerminal()
+    terminal = EventTerminal(mode=log_mode)
     client = httpx.AsyncClient()
     pipeline = None
     try:
+        ledger = Ledger(settings.ledger_path, settings.source_salt)
         snapshot_path = Path(settings.local_auth_dir) / "source-snapshot.jsonl"
         synchronizer = SSHSnapshotSynchronizer(
             service_settings.ssh_host,
             snapshot_path,
             remote_root=service_settings.remote_root,
             identity_file=service_settings.identity_file,
+            fingerprint=ledger.fingerprint,
         )
         source = DiskSnapshotSource(
             snapshot_path,
             synchronizer=synchronizer,
             sync_seconds=service_settings.sync_seconds,
             event_callback=lambda kind, data: terminal.emit((kind, data)),
+            fingerprint=ledger.fingerprint,
         )
         protocol = XAIProtocol(
             client,
@@ -564,7 +750,6 @@ async def main_async():
             Path(settings.local_auth_dir) / AUTHENTICATED_DIRNAME,
             name_secret=settings.source_salt,
         )
-        ledger = Ledger(settings.ledger_path, settings.source_salt)
         inventory = CredentialInventory(
             ledger,
             Path(settings.local_auth_dir) / AUTHENTICATED_DIRNAME,
@@ -573,6 +758,15 @@ async def main_async():
         recovered = await asyncio.to_thread(inventory.recover)
         if recovered:
             terminal.emit(("control", {"state": f"recovered {recovered} claims"}))
+        terminal.emit(
+            (
+                "startup",
+                {
+                    "destination": f"{AUTHENTICATED_DIRNAME}/",
+                    **ledger.inventory_counts(),
+                },
+            )
+        )
         pipeline = AuthPipeline(
             source=source,
             protocol=protocol,
@@ -594,12 +788,42 @@ async def main_async():
         await client.aclose()
 
 
-def main():
+def _known_configuration_key(error):
+    message = str(error)
+    keys = (
+        "XAI_AUTH_SERVICE_LOG_MODE",
+        "XAI_AUTH_SERVICE_SSH_HOST",
+        "XAI_AUTH_SERVICE_SYNC_SEC",
+        "XAI_AUTH_SERVICE_RETRY_SEC",
+        "XAI_AUTH_SERVICE_MIN_INTERVAL_SEC",
+    )
+    return next((key for key in keys if key in message), None)
+
+
+def main(argv=None):
     try:
-        asyncio.run(main_async())
+        mode = resolve_auth_log_mode(argv)
+        asyncio.run(main_async(log_mode=mode))
+        return 0
+    except AuthServiceConfigurationError as error:
+        key = _known_configuration_key(error) or "认证服务参数"
+        print(
+            f"[✗] 配置错误：{key} | 教程 docs/guides/auth-service.md#配置远端同步",
+            file=sys.stderr,
+        )
+        return 2
+    except ValueError as error:
+        key = _known_configuration_key(error)
+        if key is None:
+            raise
+        print(
+            f"[✗] 配置错误：{key} | 教程 docs/guides/auth-service.md#配置远端同步",
+            file=sys.stderr,
+        )
+        return 2
     except KeyboardInterrupt:
-        pass
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
