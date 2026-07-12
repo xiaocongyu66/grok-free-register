@@ -24,6 +24,124 @@ class AuthServiceConfigurationError(ValueError):
     pass
 
 
+class InteractiveCommandPrompt:
+    """Stdlib-only line editor that keeps commands visible during events."""
+
+    CLEAR_LINE = "\r\x1b[2K"
+
+    def __init__(
+        self,
+        *,
+        input_stream=None,
+        output=None,
+        interactive=None,
+        prompt="认证> ",
+    ):
+        self.input_stream = input_stream or sys.stdin
+        self.output = output or sys.stdout
+        self.prompt = prompt
+        if interactive is None:
+            interactive = bool(
+                getattr(self.input_stream, "isatty", lambda: False)()
+                and getattr(self.output, "isatty", lambda: False)()
+            )
+        self.interactive = interactive
+        self.buffer = ""
+        self.active = False
+        self._callback = None
+        self._fd = None
+        self._original_terminal = None
+
+    def _write(self, text):
+        try:
+            self.output.write(text)
+            self.output.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _redraw(self):
+        if self.active and self.interactive:
+            self._write(f"{self.CLEAR_LINE}{self.prompt}{self.buffer}")
+
+    def start(self, callback):
+        self._callback = callback
+        self.active = True
+        self._redraw()
+
+    def feed(self, text):
+        for character in text:
+            if character in {"\r", "\n"}:
+                command = self.buffer
+                self.buffer = ""
+                self._write("\n")
+                if command.strip() and self._callback is not None:
+                    self._callback(command)
+                if self.active and self.interactive:
+                    self._write(self.prompt)
+            elif character in {"\b", "\x7f"}:
+                self.buffer = self.buffer[:-1]
+                self._redraw()
+            elif character == "\x04":
+                if self._callback is not None:
+                    self._callback(None)
+            elif character.isprintable():
+                self.buffer += character
+                self._redraw()
+
+    def write_event(self, message):
+        if self.active and self.interactive:
+            self._write(f"{self.CLEAR_LINE}{message}\n{self.prompt}{self.buffer}")
+        else:
+            self._write(f"{message}\n")
+
+    def attach(self, loop, callback):
+        self.start(callback)
+        self._fd = self.input_stream.fileno()
+        if self.interactive:
+            import termios
+            import tty
+
+            self._original_terminal = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+
+            def stdin_ready():
+                data = os.read(self._fd, 256)
+                if data:
+                    self.feed(data.decode(errors="ignore"))
+                elif self._callback is not None:
+                    loop.remove_reader(self._fd)
+                    self._callback(None)
+
+        else:
+
+            def stdin_ready():
+                line = self.input_stream.readline()
+                if line == "":
+                    if self._callback is not None:
+                        loop.remove_reader(self._fd)
+                        self._callback(None)
+                    return
+                if self._callback is not None:
+                    self._callback(line)
+
+        loop.add_reader(self._fd, stdin_ready)
+
+    def close(self, loop):
+        if self._fd is not None:
+            with suppress(Exception):
+                loop.remove_reader(self._fd)
+        if self._original_terminal is not None and self._fd is not None:
+            import termios
+
+            with suppress(Exception):
+                termios.tcsetattr(
+                    self._fd, termios.TCSADRAIN, self._original_terminal
+                )
+        if self.active and self.interactive:
+            self._write(f"{self.CLEAR_LINE}\n")
+        self.active = False
+
+
 def resolve_auth_log_mode(argv=None, env=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     env = dict(os.environ if env is None else env)
@@ -359,6 +477,13 @@ class EventTerminal:
                 "cancelling": "[■] 正在取消当前任务",
                 "idle": "[•] 当前没有可取消的任务",
                 "stopping": "[■] 正在安全退出",
+                "usage: take <positive-count>": "[!] 用法：take N，N 必须是正整数",
+                "inventory unavailable": "[!] 当前凭据库存不可用",
+                "help": (
+                    "[•] 命令 s 状态 | take N 取用 | p 暂停 | "
+                    "r 恢复 | c 取消 | q 退出"
+                ),
+                "unknown": "[!] 未知命令 | 输入 help 查看命令",
             }
             return states.get(data.get("state"), "[•] 控制命令已处理")
         if kind == "status":
@@ -380,7 +505,8 @@ class EventTerminal:
         if kind == "inventory_taken":
             return (
                 f"[✓] 已取用 {data['moved']} 个凭据 | "
-                f"可用 {data['available']} | 批次 {data['batch_id']}"
+                f"剩余可用 {data['available']} | "
+                f"位置 claimed/{data['batch_id']}/"
             )
         if kind == "inventory_error":
             return (
@@ -570,10 +696,14 @@ class AuthPipelineRunner:
             self.emit(
                 ("control", {"state": "cancelling" if cancelled else "idle"})
             )
+        elif command in {"help", "h", "?"}:
+            self.emit(("control", {"state": "help"}))
         elif command in {"q", "quit", "exit"}:
             self.pipeline.request_stop()
             self.emit(("control", {"state": "stopping"}))
             return False
+        elif command:
+            self.emit(("control", {"state": "unknown"}))
         return True
 
     async def run(self):
@@ -660,27 +790,21 @@ class AuthServiceRunner:
                 pass
 
 
-async def _run_interactive(runner):
-    try:
-        print(
-            "命令：s 状态 | take N 取用凭据 | p 暂停 | r 恢复 | c 取消当前任务 | q 退出",
-            flush=True,
-        )
-    except OSError:
-        pass
+async def _run_interactive(runner, terminal):
     loop = asyncio.get_running_loop()
     commands = asyncio.Queue()
-    stdin_fd = sys.stdin.fileno()
-
-    def stdin_ready():
-        line = sys.stdin.readline()
-        if line == "":
-            loop.remove_reader(stdin_fd)
-            commands.put_nowait(None)
-            return
-        commands.put_nowait(line)
-
-    loop.add_reader(stdin_fd, stdin_ready)
+    prompt = InteractiveCommandPrompt()
+    previous_output = terminal.output
+    terminal.output = prompt.write_event
+    prompt.write_event(
+        "命令：s 状态 | take N 取用凭据 | p 暂停 | r 恢复 | c 取消当前任务 | q 退出"
+    )
+    try:
+        prompt.attach(loop, commands.put_nowait)
+    except Exception:
+        prompt.close(loop)
+        terminal.output = previous_output
+        raise
     worker = asyncio.create_task(runner.run())
     try:
         while not worker.done():
@@ -703,7 +827,8 @@ async def _run_interactive(runner):
         runner.pipeline.request_stop()
         raise
     finally:
-        loop.remove_reader(stdin_fd)
+        prompt.close(loop)
+        terminal.output = previous_output
         runner.pipeline.request_stop()
         await asyncio.gather(worker, return_exceptions=True)
 
@@ -787,7 +912,7 @@ async def main_async(*, log_mode="user"):
         )
         pipeline.rate_gate.COOLDOWN_SECONDS = float(service_settings.retry_seconds)
         runner = AuthPipelineRunner(pipeline, terminal.emit, inventory=inventory)
-        await _run_interactive(runner)
+        await _run_interactive(runner, terminal)
     finally:
         if pipeline is not None:
             pipeline.request_stop()

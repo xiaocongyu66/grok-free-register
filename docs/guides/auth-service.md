@@ -34,7 +34,7 @@ bash auth-service.sh
 bash auth-service.sh --debug
 ```
 
-运行中可输入：
+运行中终端底部会保持 `认证> ` 输入行。日志更新不会清掉尚未提交的内容；直接输入命令并回车：
 
 ```text
 s       查看状态

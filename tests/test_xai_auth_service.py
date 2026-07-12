@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from xai_enroller.service import (
     AuthServiceSettings,
     AuthPipelineRunner,
     EventTerminal,
+    InteractiveCommandPrompt,
     SSHRegisteredSource,
     parse_registered_accounts,
     resolve_auth_log_mode,
@@ -156,6 +158,27 @@ def test_terminal_output_failure_does_not_escape():
 
     terminal = EventTerminal(mode="user", output=broken_output)
     terminal.emit(("service_stopped", {}))
+
+
+def test_interactive_prompt_restores_partially_typed_take_command_after_events():
+    output = io.StringIO()
+    commands = []
+    prompt = InteractiveCommandPrompt(
+        output=output,
+        interactive=True,
+        prompt="认证> ",
+    )
+    prompt.start(commands.append)
+    prompt.feed("take 12")
+
+    prompt.write_event("[↻] 发现新账号 3")
+
+    assert output.getvalue().endswith("[↻] 发现新账号 3\n认证> take 12")
+
+    prompt.feed("\r")
+
+    assert commands == ["take 12"]
+    assert output.getvalue().endswith("\n认证> ")
 
 
 def test_auth_service_configuration_errors_are_actionable_without_traceback(tmp_path):
