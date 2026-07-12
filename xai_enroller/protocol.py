@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import json
 import time
 from dataclasses import dataclass
@@ -135,12 +137,37 @@ class XAIProtocol:
         raise RuntimeError("oauth_expired")
 
     @staticmethod
+    def _jwt_subject(token):
+        if not isinstance(token, str):
+            return None
+        parts = token.split(".")
+        if len(parts) != 3 or not parts[1]:
+            return None
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(claims, dict):
+            return None
+        for claim in ("sub", "principal_id"):
+            value = claims.get(claim)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    @staticmethod
     def _credential(document, endpoint):
         if not document.get("access_token") or not document.get("refresh_token"):
             raise RuntimeError("oauth_rejected")
         now = datetime.now(timezone.utc)
         expires_in = int(document.get("expires_in", 3600))
         expires_at = datetime.fromtimestamp(now.timestamp() + expires_in, timezone.utc).isoformat().replace("+00:00", "Z")
+        subject = (
+            XAIProtocol._jwt_subject(document.get("id_token"))
+            or XAIProtocol._jwt_subject(document["access_token"])
+            or document.get("sub")
+        )
         return OAuthCredential(
             access_token=document["access_token"],
             refresh_token=document["refresh_token"],
@@ -149,6 +176,6 @@ class XAIProtocol:
             expires_in=expires_in,
             expires_at=expires_at,
             last_refresh=now.isoformat().replace("+00:00", "Z"),
-            subject=document.get("sub"),
+            subject=subject,
             token_endpoint=endpoint,
         )

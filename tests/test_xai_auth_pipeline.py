@@ -7,7 +7,9 @@ from xai_enroller.models import (
     AuthorizationResult,
     AuthorizationStatus,
     DeviceFlow,
+    JobStatus,
     OAuthCredential,
+    PipelineState,
     SinkReceipt,
     SourceRecord,
 )
@@ -142,5 +144,54 @@ def test_sink_and_ledger_commit_cannot_be_cancelled_mid_commit(tmp_path):
         assert executor.calls == 1
         assert sink.calls == 1
         assert ledger.aggregate_counts()["imported_unique"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_queued_source_imported_while_paused_is_not_authorized(tmp_path):
+    async def scenario():
+        executor = ImmediateExecutor()
+        ledger = Ledger(tmp_path / "ledger.db", b"salt")
+        pipeline = AuthPipeline(
+            source=EmptySource(),
+            protocol=ImmediateProtocol(),
+            executor=executor,
+            sink=object(),
+            ledger=ledger,
+            timeout=2,
+        )
+        source = SourceRecord("stock", "opaque")
+        fingerprint = ledger.fingerprint(source.source_id)
+
+        assert await pipeline.admit(source)
+        pipeline.pause()
+        await pipeline.rate_gate.rate_limited()
+        run = asyncio.create_task(pipeline.run())
+        try:
+            async with asyncio.timeout(1):
+                while pipeline._authorization_task is None:
+                    await asyncio.sleep(0)
+
+            external_job_id = ledger.start_fingerprint(fingerprint)
+            ledger.finish(
+                external_job_id,
+                JobStatus.IMPORTED,
+                "imported",
+                "external-receipt",
+            )
+            pipeline.resume()
+
+            async with asyncio.timeout(1):
+                while (
+                    executor.calls == 0
+                    and pipeline._states.get(fingerprint) is not PipelineState.IMPORTED
+                ):
+                    await asyncio.sleep(0)
+
+            assert executor.calls == 0
+            assert pipeline._states[fingerprint] is PipelineState.IMPORTED
+        finally:
+            pipeline.request_stop()
+            await asyncio.wait_for(run, 2)
 
     asyncio.run(scenario())

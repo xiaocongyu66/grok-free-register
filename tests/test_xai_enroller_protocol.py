@@ -1,3 +1,4 @@
+import base64
 import json
 
 import httpx
@@ -5,6 +6,13 @@ import pytest
 
 from xai_enroller.models import AuthorizationStatus
 from xai_enroller.protocol import XAIProtocol, XAIProfile
+
+
+def _unsigned_jwt(payload):
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+    return f"header.{encoded}.signature"
 
 
 def test_default_profile_matches_observed_grok_cli_device_contract():
@@ -191,3 +199,47 @@ def test_token_response_requires_refresh_token_and_never_exposes_body():
             )
         )
     assert "access" not in str(error.value)
+
+
+def test_credential_subject_prefers_id_token_subject():
+    credential = XAIProtocol._credential(
+        {
+            "access_token": _unsigned_jwt({"principal_id": "access-subject"}),
+            "refresh_token": "refresh",
+            "id_token": _unsigned_jwt(
+                {"sub": "stable-subject", "email": "ignored@example.test"}
+            ),
+            "sub": "response-subject",
+        },
+        "https://auth.x.ai/oauth2/token",
+    )
+
+    assert credential.subject == "stable-subject"
+
+
+def test_credential_subject_falls_back_to_access_token_principal_id():
+    credential = XAIProtocol._credential(
+        {
+            "access_token": _unsigned_jwt({"principal_id": "stable-principal"}),
+            "refresh_token": "refresh",
+            "id_token": "malformed",
+            "sub": "response-subject",
+        },
+        "https://auth.x.ai/oauth2/token",
+    )
+
+    assert credential.subject == "stable-principal"
+
+
+def test_credential_subject_ignores_email_and_falls_back_to_response_subject():
+    credential = XAIProtocol._credential(
+        {
+            "access_token": "not-a-jwt",
+            "refresh_token": "refresh",
+            "id_token": _unsigned_jwt({"email": "ignored@example.test"}),
+            "sub": "response-subject",
+        },
+        "https://auth.x.ai/oauth2/token",
+    )
+
+    assert credential.subject == "response-subject"

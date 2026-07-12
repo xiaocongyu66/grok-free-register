@@ -468,11 +468,28 @@ class AuthPipeline:
                 self._authorization_task = None
                 self.prepared_queue.task_done()
 
+    async def _finish_if_already_imported(self, prepared, probe_token=None):
+        if not self.ledger.has_imported(prepared.source.source_id):
+            return False
+        self._authorization_cancellable = False
+        self.ledger.finish(
+            prepared.job_id,
+            JobStatus.CANCELLED,
+            "already_imported",
+        )
+        self._set_state(prepared.source_fingerprint, PipelineState.IMPORTED)
+        self._transient_retries.pop(prepared.source_fingerprint, None)
+        await self.rate_gate.inconclusive(probe_token)
+        return True
+
     async def _authorize(self, prepared):
         probe_token = None
         self._authorization_cancellable = True
         try:
             await self.start_interval.wait()
+            await self._resume.wait()
+            if await self._finish_if_already_imported(prepared):
+                return
             probe_token = await self.rate_gate.wait_for_permission(self._resume)
             while True:
                 await self._resume.wait()
@@ -508,6 +525,9 @@ class AuthPipeline:
                     prepared
                 ) >= self.FLOW_SAFETY_MARGIN_SECONDS:
                     break
+
+            if await self._finish_if_already_imported(prepared, probe_token):
+                return
 
             self._set_state(prepared.source_fingerprint, PipelineState.ACTIVE)
             self.start_interval.mark_started()
