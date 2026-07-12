@@ -796,11 +796,47 @@ def _known_configuration_key(error):
         "XAI_AUTH_SERVICE_SYNC_SEC",
         "XAI_AUTH_SERVICE_RETRY_SEC",
         "XAI_AUTH_SERVICE_MIN_INTERVAL_SEC",
+        "XAI_ENROLLER_TARGET",
+        "XAI_ENROLLER_RETRY_ATTEMPTS",
+        "XAI_ENROLLER_TIMEOUT_SEC",
+        "XAI_ENROLLER_POLL_SEC",
+        "XAI_ENROLLER_AUTH_EXECUTOR",
+        "XAI_ENROLLER_SINK",
+        "XAI_ENROLLER_CPA_BASE_URL",
+        "XAI_ENROLLER_CPA_MANAGEMENT_SECRET",
+        "XAI_ENROLLER_LOCAL_AUTH_DIR",
+        "XAI_ENROLLER_SOURCE_SALT",
     )
-    return next((key for key in keys if key in message), None)
+    explicit = next((key for key in keys if key in message), None)
+    if explicit is not None:
+        return explicit
+    message_keys = {
+        "target must be between 1 and 100": "XAI_ENROLLER_TARGET",
+        "retry attempts must be between 0 and 3": "XAI_ENROLLER_RETRY_ATTEMPTS",
+        "timeout must be positive": "XAI_ENROLLER_TIMEOUT_SEC",
+        "poll interval must be positive": "XAI_ENROLLER_POLL_SEC",
+        "executor must be http or playwright": "XAI_ENROLLER_AUTH_EXECUTOR",
+        "sink must be cpa or local": "XAI_ENROLLER_SINK",
+        "CPA base URL must use HTTPS": "XAI_ENROLLER_CPA_BASE_URL",
+        "CPA base URL and management secret are required": (
+            "XAI_ENROLLER_CPA_BASE_URL/XAI_ENROLLER_CPA_MANAGEMENT_SECRET"
+        ),
+        "local auth directory is required": "XAI_ENROLLER_LOCAL_AUTH_DIR",
+        "source salt is required": "XAI_ENROLLER_SOURCE_SALT",
+    }
+    return message_keys.get(message)
+
+
+def _print_unexpected_service_failure(error, *, log_mode):
+    if log_mode == "debug":
+        detail = f"异常类别 {type(error).__name__}"
+    else:
+        detail = "使用 bash auth-service.sh --debug 查看异常类别"
+    print(f"[✗] 认证服务异常终止 | {detail}", file=sys.stderr)
 
 
 def main(argv=None):
+    mode = "user"
     try:
         mode = resolve_auth_log_mode(argv)
         asyncio.run(main_async(log_mode=mode))
@@ -814,15 +850,19 @@ def main(argv=None):
         return 2
     except ValueError as error:
         key = _known_configuration_key(error)
-        if key is None:
-            raise
-        print(
-            f"[✗] 配置错误：{key} | 教程 docs/guides/auth-service.md#配置远端同步",
-            file=sys.stderr,
-        )
-        return 2
+        if key is not None:
+            print(
+                f"[✗] 配置错误：{key} | 教程 docs/guides/auth-service.md#配置远端同步",
+                file=sys.stderr,
+            )
+            return 2
+        _print_unexpected_service_failure(error, log_mode=mode)
+        return 1
     except KeyboardInterrupt:
         return 130
+    except Exception as error:
+        _print_unexpected_service_failure(error, log_mode=mode)
+        return 1
 
 
 if __name__ == "__main__":

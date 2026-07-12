@@ -157,7 +157,7 @@ def test_terminal_output_failure_does_not_escape():
     terminal.emit(("service_stopped", {}))
 
 
-def test_auth_service_configuration_errors_are_actionable_without_traceback():
+def test_auth_service_configuration_errors_are_actionable_without_traceback(tmp_path):
     environment = os.environ.copy()
     environment.pop("XAI_AUTH_SERVICE_SSH_HOST", None)
     environment.pop("XAI_AUTH_SERVICE_LOG_MODE", None)
@@ -182,6 +182,42 @@ def test_auth_service_configuration_errors_are_actionable_without_traceback():
     assert invalid.returncode == 2
     assert "XAI_AUTH_SERVICE_LOG_MODE" in invalid.stderr
     assert "Traceback" not in invalid.stderr
+
+    environment["XAI_AUTH_SERVICE_LOG_MODE"] = "user"
+    environment["XAI_AUTH_SERVICE_SSH_HOST"] = "user@example.test"
+    environment["XAI_ENROLLER_LOCAL_AUTH_DIR"] = str(tmp_path / "auth")
+    environment["XAI_ENROLLER_TIMEOUT_SEC"] = "not-a-number"
+    invalid_enroller_setting = subprocess.run(
+        [sys.executable, "-m", "xai_enroller.service"],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert invalid_enroller_setting.returncode == 2
+    assert "XAI_ENROLLER_TIMEOUT_SEC" in invalid_enroller_setting.stderr
+    assert "docs/guides/auth-service.md" in invalid_enroller_setting.stderr
+    assert "Traceback" not in invalid_enroller_setting.stderr
+
+
+def test_auth_service_startup_failure_is_sanitized_without_traceback(tmp_path):
+    blocked_destination = tmp_path / "private-output-path"
+    blocked_destination.write_text("not a directory", encoding="utf-8")
+    environment = os.environ.copy()
+    environment["XAI_AUTH_SERVICE_SSH_HOST"] = "user@example.test"
+    environment["XAI_ENROLLER_LOCAL_AUTH_DIR"] = str(blocked_destination)
+
+    failed = subprocess.run(
+        [sys.executable, "-m", "xai_enroller.service"],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert failed.returncode == 1
+    assert "认证服务异常终止" in failed.stderr
+    assert "bash auth-service.sh --debug" in failed.stderr
+    assert "Traceback" not in failed.stderr
+    assert str(blocked_destination) not in failed.stderr
 
 
 def test_registered_account_parser_keeps_only_email_and_sso():
