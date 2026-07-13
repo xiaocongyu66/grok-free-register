@@ -817,6 +817,151 @@ func (g *Gateway) stats() Stats {
 	}
 }
 
+func memAvailableMB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	var availKB uint64
+	for _, line := range strings.Split(string(data), "\n") {
+		var key string
+		var val uint64
+		if _, e := fmt.Sscanf(line, "%s %d", &key, &val); e != nil {
+			continue
+		}
+		if key == "MemAvailable:" {
+			availKB = val
+			break
+		}
+	}
+	return int(availKB / 1024)
+}
+
+func memTotalMB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	var totalKB uint64
+	for _, line := range strings.Split(string(data), "\n") {
+		var key string
+		var val uint64
+		if _, e := fmt.Sscanf(line, "%s %d", &key, &val); e != nil {
+			continue
+		}
+		if key == "MemTotal:" {
+			totalKB = val
+			break
+		}
+	}
+	return int(totalKB / 1024)
+}
+
+// isAutoEnv: empty / auto / 0 → automatic sizing
+func isAutoEnv(raw string) bool {
+	v := strings.TrimSpace(strings.ToLower(raw))
+	return v == "" || v == "auto" || v == "0"
+}
+
+// autoSoftHardMB picks per-browser RSS soft/hard limits from host RAM.
+// Small hosts get tighter budgets so workers recycle before OOM.
+func autoSoftHardMB() (soft, hard int) {
+	total := memTotalMB()
+	avail := memAvailableMB()
+	// base by total RAM class
+	switch {
+	case total >= 28000: // ~32G
+		soft, hard = 900, 1400
+	case total >= 14000: // ~16G HF
+		soft, hard = 750, 1200
+	case total >= 7000: // ~8G
+		soft, hard = 600, 950
+	case total >= 3500:
+		soft, hard = 450, 750
+	default:
+		soft, hard = 350, 550
+	}
+	// if currently tight, pull soft down so recycle triggers earlier
+	if avail > 0 && avail < soft*2 {
+		soft = max(300, avail/3)
+		hard = max(soft+150, soft*3/2)
+	}
+	if hard <= soft {
+		hard = soft + 200
+	}
+	return soft, hard
+}
+
+func parseSoftHardMB(softRaw, hardRaw string) (soft, hard int) {
+	autoS, autoH := autoSoftHardMB()
+	soft, hard = autoS, autoH
+	if !isAutoEnv(softRaw) {
+		if n, err := strconv.Atoi(strings.TrimSpace(softRaw)); err == nil && n > 0 {
+			soft = n
+		}
+	}
+	if !isAutoEnv(hardRaw) {
+		if n, err := strconv.Atoi(strings.TrimSpace(hardRaw)); err == nil && n > 0 {
+			hard = n
+		}
+	}
+	if hard <= soft {
+		hard = soft + 200
+	}
+	return soft, hard
+}
+
+func autoWatchdogIntervalSec() int {
+	// quieter on big hosts; more frequent when memory is tight
+	avail := memAvailableMB()
+	switch {
+	case avail >= 8000:
+		return 12
+	case avail >= 3000:
+		return 8
+	case avail >= 1500:
+		return 6
+	default:
+		return 4
+	}
+}
+
+func parseAutoInt(raw string, autoFn func() int) int {
+	if isAutoEnv(raw) {
+		return autoFn()
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n <= 0 {
+		return autoFn()
+	}
+	return n
+}
+
+func autoMaxSolves() int {
+	// recycle browsers more often on small RAM
+	total := memTotalMB()
+	switch {
+	case total >= 14000:
+		return 12
+	case total >= 7000:
+		return 8
+	default:
+		return 5
+	}
+}
+
+func autoSolveTimeoutSec() int {
+	// allow more time when few cores / slow hosts
+	cores := runtime.NumCPU()
+	if cores <= 2 {
+		return 120
+	}
+	if cores <= 4 {
+		return 100
+	}
+	return 90
+}
+
 // autoWorkers picks browser process count from CPU cores + free RAM.
 // Memory-first: each worker ≈ softMB RSS budget.
 func autoWorkers(softMB int) int {
@@ -824,29 +969,16 @@ func autoWorkers(softMB int) int {
 	if cores < 1 {
 		cores = 1
 	}
-	// default soft budget
 	if softMB <= 0 {
-		softMB = 700
+		softMB, _ = autoSoftHardMB()
 	}
-	// read free MB
-	availMB := 0
-	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
-		var availKB uint64
-		for _, line := range strings.Split(string(data), "\n") {
-			var key string
-			var val uint64
-			if _, e := fmt.Sscanf(line, "%s %d", &key, &val); e != nil {
-				continue
-			}
-			if key == "MemAvailable:" {
-				availKB = val
-				break
-			}
-		}
-		availMB = int(availKB / 1024)
+	availMB := memAvailableMB()
+	// reserve for OS + gateway + one spare browser slot
+	reserve := 1200
+	if availMB > 0 && availMB < 4000 {
+		reserve = 800
 	}
-	// reserve ~1.2GB for register/dashboard/OS
-	budget := availMB - 1200
+	budget := availMB - reserve
 	if budget < softMB {
 		return 1
 	}
@@ -854,15 +986,27 @@ func autoWorkers(softMB int) int {
 	if byMem < 1 {
 		byMem = 1
 	}
-	// CPU: leave 1 core for gateway/OS; cap at cores-1
 	byCPU := cores - 1
 	if byCPU < 1 {
 		byCPU = 1
 	}
-	// hard cap to avoid OOM storms
 	capN := envInt("SOLVER_GATEWAY_WORKERS_MAX", 8)
 	if capN < 1 {
 		capN = 8
+	}
+	// allow "auto" for max as well
+	if isAutoEnv(os.Getenv("SOLVER_GATEWAY_WORKERS_MAX")) {
+		// ~1 worker per 1.5–2GB available after reserve, capped by CPU
+		if availMB >= 12000 {
+			capN = min(cores, 8)
+		} else if availMB >= 6000 {
+			capN = min(cores, 4)
+		} else {
+			capN = min(cores, 2)
+		}
+		if capN < 1 {
+			capN = 1
+		}
 	}
 	n := byMem
 	if byCPU < n {
@@ -880,11 +1024,19 @@ func autoWorkers(softMB int) int {
 func autoConcurrency(workers int) int {
 	// async pages per browser; more concurrency = higher throughput but more RAM
 	cores := runtime.NumCPU()
-	// prefer 2 on multi-core when few workers, else 1
-	if workers <= 2 && cores >= 4 {
-		return envInt("SOLVER_WORKER_CONCURRENCY", 2)
+	avail := memAvailableMB()
+	// explicit env overrides (non-auto)
+	raw := strings.TrimSpace(os.Getenv("SOLVER_WORKER_CONCURRENCY"))
+	if !isAutoEnv(raw) {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
 	}
-	return envInt("SOLVER_WORKER_CONCURRENCY", 1)
+	// prefer 2 on multi-core when few workers and enough RAM
+	if workers <= 2 && cores >= 4 && avail >= 4000 {
+		return 2
+	}
+	return 1
 }
 
 func parseWorkersFlag(raw string, softMB int) int {
@@ -900,6 +1052,48 @@ func parseWorkersFlag(raw string, softMB int) int {
 }
 
 // --- HTTP ---
+
+
+// Optional shared-secret auth for public HF / internet exposure.
+// Set SOLVER_API_TOKEN or TURNSTILE_SOLVER_TOKEN; clients send:
+//   Authorization: Bearer <token>  or  X-API-Key: <token>  or  ?token=
+func apiToken() string {
+	return strings.TrimSpace(env("SOLVER_API_TOKEN", env("TURNSTILE_SOLVER_TOKEN", "")))
+}
+
+func authorized(r *http.Request) bool {
+	want := apiToken()
+	if want == "" {
+		return true
+	}
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(h), "bearer ") {
+		if strings.TrimSpace(h[7:]) == want {
+			return true
+		}
+	}
+	if r.Header.Get("X-API-Key") == want || r.Header.Get("X-Solver-Token") == want {
+		return true
+	}
+	if r.URL.Query().Get("token") == want {
+		return true
+	}
+	return false
+}
+
+func withAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// health always public for HF readiness probes
+		if r.URL.Path == "/health" || r.URL.Path == "/api/health" || r.URL.Path == "/" {
+			next(w, r)
+			return
+		}
+		if !authorized(r) {
+			writeJSON(w, 401, map[string]any{"ok": false, "error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1040,26 +1234,29 @@ func main() {
 	// Use all CPU cores for Go scheduler (HTTP + queue + IPC)
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	host := flag.String("host", env("SOLVER_GATEWAY_HOST", "127.0.0.1"), "bind host")
-	port := flag.Int("port", envInt("SOLVER_GATEWAY_PORT", 5080), "bind port")
-	// workers: "auto" or integer; default auto uses multi-core + free RAM
-	// auto: size workers by CPU+free RAM; request bursts go into queue
+	host := flag.String("host", env("SOLVER_GATEWAY_HOST", env("HOST", "0.0.0.0")), "bind host")
+	port := flag.Int("port", envInt("PORT", envInt("SOLVER_GATEWAY_PORT", 7860)), "bind port")
+	// Most sizing knobs accept "auto" (or empty/0) — see parseSoftHardMB / autoWorkers.
 	workersRaw := flag.String("workers", env("SOLVER_GATEWAY_WORKERS", "auto"), "browser workers (auto|N)")
-	concurrency := flag.Int("concurrency", envInt("SOLVER_WORKER_CONCURRENCY", 0), "async pages per worker (0=auto)")
-	timeout := flag.Int("timeout", envInt("SOLVER_GATEWAY_TIMEOUT", 90), "solve timeout sec")
-	queueSize := flag.Int("queue", envInt("SOLVER_GATEWAY_QUEUE", 0), "job queue size (0=auto by request load)")
-	soft := flag.Int("soft-mb", envInt("SOLVER_WATCHDOG_SOFT_MB", 700), "worker soft RSS MB")
-	hard := flag.Int("hard-mb", envInt("SOLVER_WATCHDOG_HARD_MB", 1100), "worker hard RSS MB")
-	maxSolves := flag.Int("max-solves", envInt("SOLVER_WORKER_MAX_SOLVES", 8), "recycle after N solves")
+	concurrencyRaw := flag.String("concurrency", env("SOLVER_WORKER_CONCURRENCY", "auto"), "pages per worker (auto|N)")
+	timeoutRaw := flag.String("timeout", env("SOLVER_GATEWAY_TIMEOUT", "auto"), "solve timeout sec (auto|N)")
+	queueRaw := flag.String("queue", env("SOLVER_GATEWAY_QUEUE", "auto"), "job queue size (auto|N)")
+	softRaw := flag.String("soft-mb", env("SOLVER_WATCHDOG_SOFT_MB", "auto"), "worker soft RSS MB (auto|N)")
+	hardRaw := flag.String("hard-mb", env("SOLVER_WATCHDOG_HARD_MB", "auto"), "worker hard RSS MB (auto|N)")
+	maxSolvesRaw := flag.String("max-solves", env("SOLVER_WORKER_MAX_SOLVES", "auto"), "recycle after N solves (auto|N)")
 	browser := flag.String("browser", env("TURNSTILE_SOLVER_BROWSER", "chromium"), "browser type")
 	headless := flag.Bool("headless", envBool("TURNSTILE_SOLVER_HEADLESS", true), "headless")
 	prefetch := flag.Bool("prefetch", envBool("SOLVER_WORKER_PREFETCH", true), "async warm browser+script")
 	workDir := flag.String("work-dir", env("SOLVER_GATEWAY_WORK_DIR", ""), "worker cwd")
 	flag.Parse()
 
+	softMB, hardMB := parseSoftHardMB(*softRaw, *hardRaw)
+	timeoutSec := parseAutoInt(*timeoutRaw, autoSolveTimeoutSec)
+	maxSolves := parseAutoInt(*maxSolvesRaw, autoMaxSolves)
+
 	root := env("PROJECT_ROOT", "")
 	if root == "" {
-		// assume binary lives in native/solver-gateway/
+		// assume binary lives under /app/gateway/
 		exe, _ := os.Executable()
 		root = filepath.Clean(filepath.Join(filepath.Dir(exe), "../.."))
 	}
@@ -1086,19 +1283,14 @@ func main() {
 		filepath.Join(root, "native/solver-watchdog/target/release/solver-watchdog"),
 	)
 
-	nWorkers := parseWorkersFlag(*workersRaw, *soft)
-	nConc := *concurrency
-	if nConc <= 0 {
-		nConc = autoConcurrency(nWorkers)
-	}
+	nWorkers := parseWorkersFlag(*workersRaw, softMB)
+	nConc := parseAutoInt(*concurrencyRaw, func() int { return autoConcurrency(nWorkers) })
 	if nConc < 1 {
 		nConc = 1
 	}
-	qSize := *queueSize
-	if qSize <= 0 {
-		// deep queue so multi-worker async load never blocks register
-		qSize = max(64, nWorkers*nConc*16)
-	}
+	qSize := parseAutoInt(*queueRaw, func() int {
+		return max(64, nWorkers*nConc*16)
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	g := &Gateway{
@@ -1106,7 +1298,7 @@ func main() {
 		queue:        make(chan Job, qSize),
 		workers:      max(1, nWorkers),
 		concurrency:  nConc,
-		solveTimeout: time.Duration(*timeout) * time.Second,
+		solveTimeout: time.Duration(timeoutSec) * time.Second,
 		resultTTL:    15 * time.Minute,
 		started:      time.Now(),
 		pythonBin:    env("SOLVER_PYTHON", env("PYTHON", "python3")),
@@ -1114,9 +1306,9 @@ func main() {
 		workDir:      wd,
 		utilBin:      utilBin,
 		watchdogBin:  watchdogBin,
-		softMB:       *soft,
-		hardMB:       *hard,
-		maxSolves:    *maxSolves,
+		softMB:       softMB,
+		hardMB:       hardMB,
+		maxSolves:    maxSolves,
 		browserType:  *browser,
 		headless:     *headless,
 		proxyFile:    env("TURNSTILE_SOLVER_PROXY_FILE", ""),
@@ -1125,9 +1317,10 @@ func main() {
 		cancel:       cancel,
 	}
 	fmt.Fprintf(os.Stderr,
-		"[gateway] multi-core plan: cpus=%d gomaxprocs=%d workers=%d concurrency=%d slots=%d queue=%d soft=%dMB\n",
-		runtime.NumCPU(), runtime.GOMAXPROCS(0), g.workers, g.concurrency,
-		g.workers*g.concurrency, qSize, g.softMB,
+		"[gateway] auto plan: cpus=%d mem_total=%dMB mem_avail=%dMB workers=%d conc=%d slots=%d queue=%d soft=%dMB hard=%dMB max_solves=%d timeout=%ds\n",
+		runtime.NumCPU(), memTotalMB(), memAvailableMB(),
+		g.workers, g.concurrency, g.workers*g.concurrency, qSize,
+		g.softMB, g.hardMB, g.maxSolves, timeoutSec,
 	)
 
 	if err := g.start(); err != nil {
@@ -1140,11 +1333,12 @@ func main() {
 		pidFile := filepath.Join(wd, "gateway.pid")
 		_ = os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o644)
 		statusFile := filepath.Join(wd, "watchdog-status.json")
+		wdInterval := parseAutoInt(env("SOLVER_WATCHDOG_INTERVAL_SEC", "auto"), autoWatchdogIntervalSec)
 		cmd := exec.Command(g.watchdogBin, "watch",
 			"--pid", strconv.Itoa(os.Getpid()),
 			"--soft-mb", strconv.Itoa(g.softMB*g.workers+400),
 			"--hard-mb", strconv.Itoa(g.hardMB*g.workers+800),
-			"--interval-sec", env("SOLVER_WATCHDOG_INTERVAL_SEC", "8"),
+			"--interval-sec", strconv.Itoa(wdInterval),
 			"--grace-sec", "10",
 			"--status-file", statusFile,
 			"--dry-run", // do not kill gateway itself; workers self-recycle
@@ -1159,12 +1353,13 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", g.handleIndex)
-	mux.HandleFunc("/turnstile", g.handleTurnstile)
-	mux.HandleFunc("/result", g.handleResult)
-	mux.HandleFunc("/health", g.handleHealth)
-	mux.HandleFunc("/stats", g.handleStats)
-	mux.HandleFunc("/v1/memory", g.handleMemory)
-	mux.HandleFunc("/v1/solve", g.handleTurnstile)
+	mux.HandleFunc("/turnstile", withAuth(g.handleTurnstile))
+	mux.HandleFunc("/result", withAuth(g.handleResult))
+	mux.HandleFunc("/health", withAuth(g.handleHealth))
+	mux.HandleFunc("/stats", withAuth(g.handleStats))
+	mux.HandleFunc("/v1/memory", withAuth(g.handleMemory))
+	mux.HandleFunc("/v1/solve", withAuth(g.handleTurnstile))
+	mux.HandleFunc("/api/health", withAuth(g.handleHealth))
 
 	addr := net.JoinHostPort(*host, strconv.Itoa(*port))
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
