@@ -61,6 +61,7 @@ class SSHSnapshotSynchronizer:
     def _args(self):
         args = [
             "ssh",
+            "-C",
             "-T",
             "-o",
             "BatchMode=yes",
@@ -486,6 +487,7 @@ class RemoteSessionStream:
     def _args(self):
         args = [
             "ssh",
+            "-C",
             "-T",
             "-o",
             "BatchMode=yes",
