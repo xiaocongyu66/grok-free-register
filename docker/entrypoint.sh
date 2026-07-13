@@ -18,6 +18,10 @@ export TURNSTILE_SOLVER_ON_DEMAND="${TURNSTILE_SOLVER_ON_DEMAND:-1}"
 export TURNSTILE_SOLVER_HEADLESS="${TURNSTILE_SOLVER_HEADLESS:-1}"
 export REGISTER_ENGINE="${REGISTER_ENGINE:-protocol}"
 export CONTROL_PLANE_ALLOW_ACTIONS="${CONTROL_PLANE_ALLOW_ACTIONS:-1}"
+# Panel auth: set DASHBOARD_PASSWORD (and optional DASHBOARD_USER) via Space Secrets
+export DASHBOARD_USER="${DASHBOARD_USER:-${CONTROL_PLANE_USER:-admin}}"
+export DASHBOARD_PASSWORD="${DASHBOARD_PASSWORD:-${CONTROL_PLANE_PASSWORD:-${PANEL_PASSWORD:-}}}"
+export CONTROL_PLANE_TOKEN="${CONTROL_PLANE_TOKEN:-${DASHBOARD_TOKEN:-${PANEL_TOKEN:-}}}"
 
 mkdir -p /data/keys /data/logs /app/logs
 
@@ -62,6 +66,12 @@ done
 # Prefer CapSolver if key present (no browser pressure)
 if [ -n "${CAPSOLVER_API_KEY:-}${CAPSOLVER_KEY:-}" ]; then
   echo "✅ CapSolver key detected — protocol path can skip heavy browser when solver API used"
+fi
+
+if [ -n "${DASHBOARD_PASSWORD}" ] || [ -n "${CONTROL_PLANE_TOKEN}" ]; then
+  echo "🔒 Panel auth enabled (DASHBOARD_PASSWORD / CONTROL_PLANE_TOKEN)"
+else
+  echo "⚠️  Panel auth OFF — set DASHBOARD_PASSWORD secret for public Spaces"
 fi
 
 echo "🚀 Starting grok-free-register dashboard..."

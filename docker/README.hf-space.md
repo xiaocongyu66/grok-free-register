@@ -21,6 +21,12 @@
 4. **Secrets**（Settings → Repository secrets）建议：
 
 ```text
+# 面板密码（公网 Space 务必设置）
+DASHBOARD_USER=admin
+DASHBOARD_PASSWORD=your_strong_password
+# 可选 API Token：Authorization: Bearer ...
+# CONTROL_PLANE_TOKEN=...
+
 MOEMAIL_API_KEY=...
 MOEMAIL_API=https://...
 MOEMAIL_DOMAIN=...
@@ -31,6 +37,12 @@ TURNSTILE_SOLVER=hybrid
 TURNSTILE_SOLVER_THREADS=2
 GO_REGISTER_WORKERS=4
 CONTROL_PLANE_ALLOW_ACTIONS=1
+```
+
+浏览器会弹出 Basic 登录；API：
+
+```bash
+curl -u admin:your_strong_password https://xxx.hf.space/api/status
 ```
 
 5. 可选 Variables：`TURNSTILE_SOLVER_ON_DEMAND=1`

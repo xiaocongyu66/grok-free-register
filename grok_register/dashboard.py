@@ -3,14 +3,23 @@ Web control plane + dashboard for grok-free-register.
 
 Read-only by default; optional process start/stop when CONTROL_PLANE_ALLOW_ACTIONS=1.
 
+Auth (optional, via env):
+  DASHBOARD_PASSWORD / CONTROL_PLANE_PASSWORD  — enable HTTP Basic (user default admin)
+  DASHBOARD_USER / CONTROL_PLANE_USER          — Basic username (default: admin)
+  CONTROL_PLANE_TOKEN / DASHBOARD_TOKEN        — Bearer token alternative
+
   python -m grok_register.dashboard
   bash start.sh --dashboard
   open http://127.0.0.1:8787/
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -52,11 +61,91 @@ ALLOW_ACTIONS = (os.environ.get("CONTROL_PLANE_ALLOW_ACTIONS") or "1").strip().l
     "on",
 }
 
+
+def _env_first(*keys: str, default: str = "") -> str:
+    for k in keys:
+        v = (os.environ.get(k) or "").strip()
+        if v:
+            return v
+    return default
+
+
+# Password gate: any of these non-empty enables auth
+DASHBOARD_USER = _env_first("DASHBOARD_USER", "CONTROL_PLANE_USER", default="admin")
+DASHBOARD_PASSWORD = _env_first(
+    "DASHBOARD_PASSWORD",
+    "CONTROL_PLANE_PASSWORD",
+    "PANEL_PASSWORD",
+)
+CONTROL_PLANE_TOKEN = _env_first(
+    "CONTROL_PLANE_TOKEN",
+    "DASHBOARD_TOKEN",
+    "PANEL_TOKEN",
+)
+# Paths that stay public (HF / k8s health probes)
+AUTH_PUBLIC_PATHS = frozenset({"/api/health"})
+
 _action_lock = threading.Lock()
 _last_action: dict = {"action": None, "ok": None, "message": "", "at": 0}
 _last_probe: dict = {"ok": None, "at": 0, "message": "", "results": []}
 _LAST_ACTION_PATH = PROJECT_ROOT / "logs" / "dashboard-last-action.json"
 _LAST_PROBE_PATH = PROJECT_ROOT / "logs" / "dashboard-last-probe.json"
+
+
+def auth_required() -> bool:
+    """True when password or token is configured."""
+    return bool(DASHBOARD_PASSWORD or CONTROL_PLANE_TOKEN)
+
+
+def _const_eq(a: str, b: str) -> bool:
+    if a is None or b is None:
+        return False
+    return hmac.compare_digest(
+        hashlib.sha256(a.encode("utf-8")).digest(),
+        hashlib.sha256(b.encode("utf-8")).digest(),
+    )
+
+
+def _check_basic_auth(header_val: str) -> bool:
+    if not DASHBOARD_PASSWORD:
+        return False
+    if not header_val or not header_val.lower().startswith("basic "):
+        return False
+    try:
+        raw = base64.b64decode(header_val.split(" ", 1)[1].strip()).decode("utf-8")
+    except Exception:
+        return False
+    if ":" not in raw:
+        return False
+    user, _, password = raw.partition(":")
+    return _const_eq(user, DASHBOARD_USER) and _const_eq(password, DASHBOARD_PASSWORD)
+
+
+def _check_bearer_auth(header_val: str) -> bool:
+    if not CONTROL_PLANE_TOKEN:
+        return False
+    if not header_val:
+        return False
+    val = header_val.strip()
+    token = ""
+    if val.lower().startswith("bearer "):
+        token = val[7:].strip()
+    elif val.lower().startswith("token "):
+        token = val[6:].strip()
+    else:
+        # allow raw token in Authorization for simple clients
+        token = val
+    return _const_eq(token, CONTROL_PLANE_TOKEN)
+
+
+def _check_query_token(qs: dict) -> bool:
+    if not CONTROL_PLANE_TOKEN:
+        return False
+    for key in ("token", "access_token", "api_token"):
+        vals = qs.get(key) or []
+        if vals and _const_eq(str(vals[0]), CONTROL_PLANE_TOKEN):
+            return True
+    return False
 
 
 def _load_json_file(path: Path) -> dict:
@@ -1937,18 +2026,70 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _unauthorized(self, *, for_browser: bool = True) -> None:
+        body = json.dumps(
+            {
+                "ok": False,
+                "error": "unauthorized",
+                "message": "需要登录：设置 DASHBOARD_PASSWORD 后使用 HTTP Basic，"
+                "或 Authorization: Bearer <CONTROL_PLANE_TOKEN>",
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if for_browser and DASHBOARD_PASSWORD:
+            # Triggers browser password prompt
+            self.send_header(
+                "WWW-Authenticate",
+                'Basic realm="grok-free-register", charset="UTF-8"',
+            )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authorized(self, path: str, qs: dict | None = None) -> bool:
+        if not auth_required():
+            return True
+        if path in AUTH_PUBLIC_PATHS:
+            return True
+        auth = self.headers.get("Authorization") or self.headers.get("authorization") or ""
+        if DASHBOARD_PASSWORD and _check_basic_auth(auth):
+            return True
+        if CONTROL_PLANE_TOKEN and (
+            _check_bearer_auth(auth) or _check_query_token(qs or {})
+        ):
+            return True
+        # X-API-Key / X-Control-Token headers
+        if CONTROL_PLANE_TOKEN:
+            for hk in ("X-API-Key", "X-Control-Token", "X-Dashboard-Token"):
+                hv = self.headers.get(hk) or ""
+                if hv and _const_eq(hv.strip(), CONTROL_PLANE_TOKEN):
+                    return True
+        return False
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
+        if path == "/api/health":
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "auth_required": auth_required(),
+                },
+            )
+            return
+        if not self._authorized(path, qs):
+            self._unauthorized(for_browser=path in {"/", "/index.html"} or not path.startswith("/api/"))
+            return
         if path in {"/", "/index.html"}:
             self._send(200, DASHBOARD_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/api/status":
             self._json(200, build_overview())
-            return
-        if path == "/api/health":
-            self._json(200, {"ok": True})
             return
         if path in {"/api/probe/xai", "/api/xai/probe"}:
             qs = parse_qs(urlparse(self.path).query)
@@ -2012,6 +2153,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             self._json(400, {"ok": False, "error": "invalid json"})
+            return
+        # Auth before any action (token may also be in JSON body)
+        qs_extra: dict = {}
+        if isinstance(data, dict):
+            for key in ("token", "access_token", "api_token"):
+                if data.get(key):
+                    qs_extra[key] = [str(data.get(key))]
+        if not self._authorized(path, qs_extra):
+            self._unauthorized(for_browser=False)
             return
         action = str((data or {}).get("action") or "").strip().lower()
         # Safe/read-side actions: no CONTROL_PLANE_ALLOW_ACTIONS required
@@ -2294,6 +2444,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[*] dashboard http://{args.host}:{args.port}/")
     print(f"[*] status file: {status_path()}")
     print(f"[*] actions: {'ENABLED' if ALLOW_ACTIONS else 'disabled (CONTROL_PLANE_ALLOW_ACTIONS=0)'}")
+    if auth_required():
+        modes = []
+        if DASHBOARD_PASSWORD:
+            modes.append(f"Basic user={DASHBOARD_USER!r}")
+        if CONTROL_PLANE_TOKEN:
+            modes.append("Bearer token")
+        print(f"[*] auth: REQUIRED ({', '.join(modes)})")
+    else:
+        print(
+            "[*] auth: OFF — set DASHBOARD_PASSWORD or CONTROL_PLANE_TOKEN "
+            "to protect the panel (recommended on 0.0.0.0 / HF Space)"
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
