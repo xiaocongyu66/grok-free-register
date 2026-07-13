@@ -3273,6 +3273,38 @@ def _build_auto_start_args() -> list[str]:
     return args
 
 
+def _print_register_log_tail(*, title: str = "register log tail", max_lines: int = 40) -> None:
+    """Mirror register file log into container stdout (HF Logs tab)."""
+    try:
+        from grok_register.run_log import (
+            register_dashboard_log_path,
+            register_fail_log_path,
+            tail_text,
+            recent_fail_summary,
+        )
+
+        path = register_dashboard_log_path()
+        tail = tail_text(path, max_bytes=6000, max_lines=max_lines)
+        print(f"[*] --- {title}: {path} ---", flush=True)
+        if tail:
+            for line in tail.splitlines():
+                print(f"[register] {line}", flush=True)
+        else:
+            print("[register] (empty)", flush=True)
+        fails = recent_fail_summary(limit=5)
+        if fails:
+            print("[*] --- recent fail events ---", flush=True)
+            for f in fails:
+                print(
+                    f"[fail] {f.get('ts_iso','')} {f.get('kind','')}: {f.get('message','')[:300]}",
+                    flush=True,
+                )
+            print(f"[*] fail log file: {register_fail_log_path()}", flush=True)
+        print("[*] --- end log tail ---", flush=True)
+    except Exception as exc:
+        print(f"[!] could not print register log: {exc}", flush=True)
+
+
 def _maybe_auto_start_register(*, reason: str = "boot") -> dict:
     """Spawn register once at panel boot (and for supervisor restarts)."""
     if process_alive():
@@ -3311,11 +3343,32 @@ def _maybe_auto_start_register(*, reason: str = "boot") -> dict:
     _record_last_action("auto_start", result if isinstance(result, dict) else {"ok": False})
     msg = (result or {}).get("message") if isinstance(result, dict) else str(result)
     print(f"[*] AUTO_START_REGISTER result: {msg}", flush=True)
+    if not (result or {}).get("ok"):
+        _print_register_log_tail(title="auto-start failed")
+        return result if isinstance(result, dict) else {"ok": False, "message": str(result)}
+    # re-check after a few seconds — many failures happen after first health delay
+    if not _register_supervisor_stop.wait(4.0):
+        if not process_alive():
+            print("[!] register exited within ~4s after spawn — dumping log", flush=True)
+            _print_register_log_tail(title="died shortly after start")
+            try:
+                from grok_register.run_log import append_fail
+
+                append_fail(
+                    "early_exit",
+                    "register died within 4s of auto-start",
+                    engine=engine,
+                    level="error",
+                )
+            except Exception:
+                pass
+        else:
+            print(f"[*] register still alive pid={read_pid()}", flush=True)
     return result if isinstance(result, dict) else {"ok": False, "message": str(result)}
 
 
 def _register_supervisor_loop() -> None:
-    """If register exits, respawn (HF often loses child after UI start)."""
+    """If register exits, dump log to container stdout and optionally respawn."""
     # initial delay so /api/health is up first
     delay = max(1.0, float(os.environ.get("AUTO_START_DELAY_SEC") or "3"))
     if _register_supervisor_stop.wait(delay):
@@ -3323,12 +3376,20 @@ def _register_supervisor_loop() -> None:
     if _auto_start_register_enabled():
         _maybe_auto_start_register(reason="boot")
     interval = max(5.0, float(os.environ.get("AUTO_RESTART_INTERVAL_SEC") or "15"))
+    was_alive = process_alive()
     while not _register_supervisor_stop.is_set():
         if _register_supervisor_stop.wait(interval):
             break
+        alive = process_alive()
+        if was_alive and not alive:
+            print("[!] register process gone — dumping log to container stdout", flush=True)
+            _print_register_log_tail(title="register exited")
+        elif alive and not was_alive:
+            print(f"[*] register running again pid={read_pid()}", flush=True)
+        was_alive = alive
         if not _auto_restart_register_enabled():
             continue
-        if process_alive():
+        if alive:
             continue
         # avoid thrashing if last exit was instant crash
         try:
