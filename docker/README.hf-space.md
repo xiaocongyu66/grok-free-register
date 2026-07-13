@@ -17,10 +17,12 @@
 
 1. 新建 Space → **SDK: Docker**
 2. Hardware：**2 vCPU · 16 GB RAM**（或更高）
-3. **必须用完整仓库作构建上下文**（不要只上传单独 Dockerfile）  
-   - 推荐：Space → Settings → 连 GitHub `xiaocongyu66/grok-free-register` 的 `main`  
-   - 若手动上传，至少包含：`Dockerfile`、`docker/`、`grok_register/`、`xai_enroller/`、`native/`、`vendor/`、`scripts/`  
-   - 构建日志里若出现 `"/requirements.txt": not found`：说明 Space 提交不完整；请同步整库并 Rebuild（新 Dockerfile 已不再依赖该文件）
+3. **构建源码**  
+   - Dockerfile 会在构建时 **`git clone` 完整仓库**  
+     `https://github.com/xiaocongyu66/grok-free-register`（`main`）  
+   - 因此 Space 里即使只有 `Dockerfile` 也能编过（不要用缺 `grok_register/` 的半截树）  
+   - 日志里若仍是旧 Commit SHA（如 `b084584`）且路径报错：到 Space **Factory rebuild**，并确认推送了含 clone 逻辑的最新 Dockerfile  
+   - 可选 build-arg：`REPO_URL` / `REPO_REF` 换分支
 4. **Secrets**（Settings → Repository secrets）建议：
 
 ```text
