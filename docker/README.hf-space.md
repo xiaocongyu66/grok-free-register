@@ -44,9 +44,13 @@ GO_REGISTER_WORKERS=4
 CONTROL_PLANE_ALLOW_ACTIONS=1
 ```
 
-浏览器会弹出 Basic 登录；API：
+面板 HTML（`GET /`）与 `/api/health` **始终 200**，避免 HF「启动中」卡死。  
+API / 下载需登录：打开页面后用登录框输入 `DASHBOARD_USER` / `DASHBOARD_PASSWORD`。
 
 ```bash
+# 健康检查（无需密码）
+curl -sS https://xxx.hf.space/api/health
+# 状态 API
 curl -u admin:your_strong_password https://xxx.hf.space/api/status
 ```
 

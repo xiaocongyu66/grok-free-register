@@ -89,8 +89,18 @@ CONTROL_PLANE_TOKEN = _env_first(
     "DASHBOARD_TOKEN",
     "PANEL_TOKEN",
 )
-# Paths that stay public (HF / k8s health probes)
-AUTH_PUBLIC_PATHS = frozenset({"/api/health"})
+# Paths that stay public (HF Space / k8s health probes hit GET / and expect HTTP 200).
+# HTML shell is public; JSON APIs and downloads still require auth when configured.
+AUTH_PUBLIC_PATHS = frozenset({
+    "/",
+    "/index.html",
+    "/api/health",
+    "/health",
+    "/healthz",
+    "/ready",
+    "/readyz",
+    "/favicon.ico",
+})
 
 _action_lock = threading.Lock()
 _last_action: dict = {"action": None, "ok": None, "message": "", "at": 0}
@@ -913,9 +923,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .cfg-help{color:var(--muted);font-size:12px;margin-top:6px;line-height:1.45}
   .cfg-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
   .cfg-empty{color:var(--muted);padding:20px;text-align:center}
+  #login-overlay{position:fixed;inset:0;z-index:1000;background:rgba(6,10,18,.88);display:none;align-items:center;justify-content:center;padding:20px}
+  #login-overlay.show{display:flex}
+  #login-box{width:min(400px,100%);background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px 20px;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+  #login-box h2{margin:0 0 6px;font-size:18px}
+  #login-box .note{margin-bottom:14px}
+  #login-box label{display:block;margin:10px 0 4px;font-size:12px;color:var(--muted)}
+  #login-box input{width:100%;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;box-sizing:border-box}
+  #login-err{color:var(--bad);min-height:1.2em;margin-top:8px;font-size:13px}
+  #btn-logout{display:none}
 </style>
 </head>
 <body>
+<div id="login-overlay" aria-hidden="true">
+  <div id="login-box">
+    <h2 data-i18n="login_title">面板登录</h2>
+    <div class="note" data-i18n="login_hint">Space 已启用 DASHBOARD_PASSWORD。页面本身可打开；API 需登录后使用。</div>
+    <label data-i18n="login_user">用户名</label>
+    <input id="login-user" type="text" autocomplete="username" value="admin" />
+    <label data-i18n="login_pass">密码</label>
+    <input id="login-pass" type="password" autocomplete="current-password" />
+    <div class="actions" style="margin-top:14px">
+      <button class="act primary" id="btn-login" data-i18n="login_btn">登录</button>
+    </div>
+    <div id="login-err"></div>
+  </div>
+</div>
 <header>
   <div>
     <h1 data-i18n="title">Grok 免费注册 · 控制面板</h1>
@@ -926,6 +959,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <button type="button" id="lang-zh" class="active" data-lang="zh">中文</button>
       <button type="button" id="lang-en" data-lang="en">EN</button>
     </div>
+    <button type="button" class="act" id="btn-logout" data-i18n="logout_btn">退出</button>
     <div id="run-badge" class="badge bad"><span class="dot"></span><span data-i18n="offline">离线</span></div>
   </div>
 </header>
@@ -1163,6 +1197,14 @@ const I18N = {
     tab_raw: "原始 JSON",
     offline: "离线",
     running: "运行中",
+    login_title: "面板登录",
+    login_hint: "Space 已启用密码。页面可打开；操作 API 需登录。",
+    login_user: "用户名",
+    login_pass: "密码",
+    login_btn: "登录",
+    logout_btn: "退出",
+    login_need: "请输入密码",
+    login_fail: "登录失败：用户名或密码错误",
     card_register: "注册控制",
     card_products: "成品下载",
     card_engines: "引擎",
@@ -1328,6 +1370,14 @@ const I18N = {
     tab_raw: "Raw JSON",
     offline: "offline",
     running: "running",
+    login_title: "Panel login",
+    login_hint: "Password is required for APIs. The page shell loads without auth (HF health).",
+    login_user: "Username",
+    login_pass: "Password",
+    login_btn: "Sign in",
+    logout_btn: "Sign out",
+    login_need: "Enter password",
+    login_fail: "Login failed: bad username or password",
     card_register: "Register control",
     card_products: "Product downloads",
     card_engines: "Engines",
@@ -1488,7 +1538,8 @@ const I18N = {
 
 const LANG_KEY = "gfr_dashboard_lang";
 const CFG_MODE_KEY = "gfr_cfg_mode";
-const state = { status:null, config:null, dirty:{}, accounts:null, lang:"zh", cfgMode:"simple", cfgSearch:"" };
+const AUTH_KEY = "gfr_dashboard_basic";
+const state = { status:null, config:null, dirty:{}, accounts:null, lang:"zh", cfgMode:"simple", cfgSearch:"", authRequired:false };
 
 function detectLang(){
   // 强制默认中文；仅用户主动切到 EN 才记英文
@@ -1517,7 +1568,90 @@ function t(key, vars){
   return s;
 }
 function $(id){return document.getElementById(id)}
-async function api(path, opts){const r=await fetch(path,opts); return r.json()}
+function getBasicAuth(){
+  try{ return sessionStorage.getItem(AUTH_KEY) || ""; }catch(e){ return ""; }
+}
+function setBasicAuth(user, pass){
+  const token = btoa(unescape(encodeURIComponent((user||"admin")+":"+(pass||""))));
+  try{ sessionStorage.setItem(AUTH_KEY, token); }catch(e){}
+  return token;
+}
+function clearBasicAuth(){
+  try{ sessionStorage.removeItem(AUTH_KEY); }catch(e){}
+}
+function showLogin(msg){
+  const ov=$("login-overlay");
+  if(!ov) return;
+  ov.classList.add("show");
+  ov.setAttribute("aria-hidden","false");
+  const err=$("login-err");
+  if(err) err.textContent = msg || "";
+  const lo=$("btn-logout");
+  if(lo) lo.style.display="none";
+}
+function hideLogin(){
+  const ov=$("login-overlay");
+  if(!ov) return;
+  ov.classList.remove("show");
+  ov.setAttribute("aria-hidden","true");
+  const lo=$("btn-logout");
+  if(lo && getBasicAuth()) lo.style.display="inline-flex";
+}
+async function api(path, opts){
+  opts = opts || {};
+  const headers = Object.assign({}, opts.headers||{});
+  const basic = getBasicAuth();
+  if(basic && !headers.Authorization && !headers.authorization){
+    headers.Authorization = "Basic "+basic;
+  }
+  const r = await fetch(path, Object.assign({}, opts, {headers}));
+  let data = null;
+  try{ data = await r.json(); }catch(e){ data = {ok:false, error:"bad json", status:r.status}; }
+  if(r.status === 401){
+    state.authRequired = true;
+    showLogin(t("login_fail"));
+    data = data || {};
+    data.ok = false;
+    data.error = data.error || "unauthorized";
+    data._http = 401;
+  }
+  return data;
+}
+async function downloadAuthed(url, fallbackName){
+  const headers = {};
+  const basic = getBasicAuth();
+  if(basic) headers.Authorization = "Basic "+basic;
+  const r = await fetch(url, {headers});
+  if(r.status === 401){
+    state.authRequired = true;
+    showLogin(t("login_fail"));
+    return;
+  }
+  if(!r.ok){
+    let msg = "download failed "+r.status;
+    try{ const j=await r.json(); msg=j.error||j.message||msg; }catch(e){}
+    alert(msg);
+    return;
+  }
+  const cd = r.headers.get("Content-Disposition")||"";
+  let name = fallbackName || "download.bin";
+  const m = /filename=\"?([^\";]+)\"?/i.exec(cd);
+  if(m) name = m[1];
+  const blob = await r.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+document.addEventListener("click",(e)=>{
+  const a = e.target && e.target.closest ? e.target.closest("a.dl") : null;
+  if(!a || !a.getAttribute("href")) return;
+  const href = a.getAttribute("href");
+  if(!href.startsWith("/api/download")) return;
+  e.preventDefault();
+  downloadAuthed(href, a.textContent.replace(/^↓\s*/,"").trim()||"download");
+});
 function fmt(v){if(v===null||v===undefined||v==='')return '—'; if(typeof v==='number') return Number.isInteger(v)?String(v):v.toFixed(2); return String(v)}
 function shortTime(iso){
   if(!iso) return '—';
@@ -2332,8 +2466,47 @@ state.lang = detectLang();
 state.cfgMode = detectCfgMode();
 applyStaticI18n();
 restoreBatchOptions();
-refreshStatus();
-loadConfig();
+$("btn-login")?.addEventListener("click", async()=>{
+  const user = ($("login-user")?.value || "admin").trim() || "admin";
+  const pass = $("login-pass")?.value || "";
+  if(!pass){ $("login-err").textContent=t("login_need"); return; }
+  setBasicAuth(user, pass);
+  $("login-err").textContent="…";
+  try{
+    const r = await api("/api/status");
+    if(r && r.ok !== false && !r._http){
+      hideLogin();
+      $("login-err").textContent="";
+      await refreshStatus();
+      await loadConfig();
+    }else{
+      clearBasicAuth();
+      showLogin(t("login_fail"));
+    }
+  }catch(e){
+    clearBasicAuth();
+    showLogin(String(e));
+  }
+});
+$("login-pass")?.addEventListener("keydown",(e)=>{ if(e.key==="Enter") $("btn-login")?.click(); });
+$("btn-logout")?.addEventListener("click",()=>{
+  clearBasicAuth();
+  showLogin("");
+});
+// Probe health (public) then status (may need auth)
+(async()=>{
+  try{
+    const h = await fetch("/api/health").then(r=>r.json()).catch(()=>({}));
+    state.authRequired = !!h.auth_required;
+  }catch(e){}
+  if(state.authRequired && !getBasicAuth()){
+    showLogin("");
+  }else{
+    hideLogin();
+  }
+  refreshStatus();
+  loadConfig();
+})();
 setInterval(()=>refreshStatus(), 2000);
 </script>
 </body>
@@ -2379,13 +2552,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _unauthorized(self, *, for_browser: bool = True) -> None:
+    def _unauthorized(self, *, for_browser: bool = False) -> None:
+        # Never challenge HTML with WWW-Authenticate: HF Space health checks
+        # probe GET / and treat 401 as "starting forever".
         body = json.dumps(
             {
                 "ok": False,
                 "error": "unauthorized",
-                "message": "需要登录：设置 DASHBOARD_PASSWORD 后使用 HTTP Basic，"
-                "或 Authorization: Bearer <CONTROL_PLANE_TOKEN>",
+                "auth_required": True,
+                "message": "需要登录：在面板登录框输入 DASHBOARD_USER/PASSWORD，"
+                "或 Authorization: Basic / Bearer <CONTROL_PLANE_TOKEN>",
             },
             ensure_ascii=False,
         ).encode("utf-8")
@@ -2393,12 +2569,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        if for_browser and DASHBOARD_PASSWORD:
-            # Triggers browser password prompt
-            self.send_header(
-                "WWW-Authenticate",
-                'Basic realm="grok-free-register", charset="UTF-8"',
-            )
+        # Intentionally omit WWW-Authenticate so fetch() can show in-page login
+        # instead of a browser modal that breaks HF readiness probes.
         self.end_headers()
         self.wfile.write(body)
 
@@ -2426,20 +2598,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
-        if path == "/api/health":
+        # Health / readiness — always 200 (HF Space readiness probe)
+        if path in {"/api/health", "/health", "/healthz", "/ready", "/readyz"}:
             self._json(
                 200,
                 {
                     "ok": True,
+                    "ready": True,
                     "auth_required": auth_required(),
+                    "public_url": public_dashboard_url(),
+                    "space_id": (os.environ.get("SPACE_ID") or "").strip() or None,
                 },
             )
             return
-        if not self._authorized(path, qs):
-            self._unauthorized(for_browser=path in {"/", "/index.html"} or not path.startswith("/api/"))
-            return
+        # HTML shell always 200 so platform probes and first paint succeed
         if path in {"/", "/index.html"}:
             self._send(200, DASHBOARD_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+        if not self._authorized(path, qs):
+            self._unauthorized(for_browser=False)
             return
         if path == "/api/status":
             self._json(200, build_overview())
