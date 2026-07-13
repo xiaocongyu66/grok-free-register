@@ -4475,7 +4475,7 @@ async def main():
         print(f"[✗] {exc}", file=sys.stderr)
         return 2
     print_stack_banner()
-    global TARGET, _c_hot_page_pool_size, TURNSTILE_API_URL
+    global TARGET, _c_hot_page_pool_size, TURNSTILE_API_URL, SITE_KEY, ACTION_ID, STATE_TREE
     max_mem_arg = None
     for i, arg in enumerate(sys.argv[1:], 1):
         if arg == '--max-mem' and i + 1 < len(sys.argv):
@@ -4560,9 +4560,59 @@ async def main():
     except Exception as exc:
         debug_log(f"[*] write turnstile solver proxies failed: {sanitize_terminal_error(exc)}")
 
-    # Turnstile: on-demand by default — do not pre-start heavy hybrid/d3vin.
-    # Local browser inject works without external solver; API path auto-starts
-    # on first ConnectionError via ensure_solver_if_needed.
+    reg_engine = (os.environ.get("REGISTER_ENGINE") or "protocol").strip().lower()
+
+    # Protocol / Go path: pure HTTP signup — does NOT need Next.js ACTION_ID/STATE_TREE.
+    # Never call Playwright fetch_config here: HF/proxy failure used to exit instantly.
+    if reg_engine in {"go", "protocol", "http"}:
+        from grok_register.go_register import maybe_run_go_register_from_python
+        from grok_register.protocol_register import TURNSTILE_SITEKEY as _PROTO_SITEKEY
+
+        SITE_KEY = SITE_KEY or _PROTO_SITEKEY
+        ACTION_ID = ACTION_ID or ""
+        STATE_TREE = STATE_TREE or ""
+        log(
+            f"[*] 协议注册 engine={reg_engine} sitekey={SITE_KEY} "
+            f"(无需抓取 Next.js ACTION_ID/STATE_TREE)"
+        )
+
+        if is_api_backend(TURNSTILE_SOLVER):
+            if turnstile_health_check(TURNSTILE_API_URL, timeout=1.2):
+                log(f"[*] 协议注册：复用已运行的 Turnstile {TURNSTILE_API_URL}")
+            else:
+                log(
+                    f"[*] 协议注册：Turnstile 按需启动；"
+                    f"url={TURNSTILE_API_URL}"
+                )
+        log("[*] 协议注册引擎 (HTTP 协议路径，不写 accounts.cpa.json)")
+        if TURNSTILE_API_URL:
+            os.environ["TURNSTILE_API_URL"] = TURNSTILE_API_URL
+        atexit.register(_stop_managed_turnstile_solver)
+        try:
+            code = maybe_run_go_register_from_python(
+                SITE_KEY,
+                ACTION_ID,
+                STATE_TREE,
+            )
+            return 0 if code is None else int(code)
+        finally:
+            try:
+                _stop_managed_turnstile_solver()
+                log("[*] 协议注册结束：已停止 Turnstile solver 进程组")
+            except Exception as exc:
+                debug_log(f"stop solver after protocol: {exc}")
+
+    # Browser path (REGISTER_ENGINE=python): needs page config + Playwright
+    try:
+        await fetch_config()
+    except Exception as exc:
+        log(f"[!] 浏览器路径 config 抓取失败: {sanitize_terminal_error(exc)}")
+        return 2
+    if not all([SITE_KEY, ACTION_ID, STATE_TREE]):
+        log("[!] 浏览器路径需要 SITE_KEY/ACTION_ID/STATE_TREE，config 不完整")
+        return 2
+
+    # Turnstile warm-up for browser path
     if is_api_backend(TURNSTILE_SOLVER):
         try:
             if TURNSTILE_SOLVER in ("d3vin", "theyka"):
@@ -4589,44 +4639,8 @@ async def main():
                 log(f"[*] Turnstile API: {TURNSTILE_API_URL}")
         except Exception as exc:
             log(f"[!] Turnstile 配置检查失败: {sanitize_terminal_error(exc)}")
-            # Non-fatal for local fallback paths
             if TURNSTILE_SOLVER not in ("local",):
                 log("[!] 将在首次求解失败时再尝试启动 solver")
-
-    await fetch_config()
-
-    # Protocol register (HTTP / Go worker) — preferred when REGISTER_ENGINE=go|protocol
-    reg_engine = (os.environ.get("REGISTER_ENGINE") or "python").strip().lower()
-    if reg_engine in {"go", "protocol", "http"}:
-        from grok_register.go_register import maybe_run_go_register_from_python
-
-        if not all([SITE_KEY, ACTION_ID, STATE_TREE]):
-            log("[!] 协议注册需要 SITE_KEY/ACTION_ID/STATE_TREE，config fetch 不完整")
-            return 2
-        # On-demand Turnstile: protocol path solves captcha only after mailbox+code.
-        # Do not warm-start solver here; first solve_turnstile_sync will force-start.
-        if is_api_backend(TURNSTILE_SOLVER):
-            if turnstile_health_check(TURNSTILE_API_URL, timeout=1.2):
-                log(f"[*] 协议注册：复用已运行的 Turnstile {TURNSTILE_API_URL}")
-            else:
-                log(
-                    f"[*] 协议注册：Turnstile 暂不启动（按需）；"
-                    f"邮箱/验证码通过后首次 signup 再拉起 {TURNSTILE_API_URL}"
-                )
-        log("[*] 协议注册引擎 (HTTP 协议路径，不写 accounts.cpa.json)")
-        if TURNSTILE_API_URL:
-            os.environ["TURNSTILE_API_URL"] = TURNSTILE_API_URL
-        # Always tear down hybrid stack when register exits (success or fail)
-        atexit.register(_stop_managed_turnstile_solver)
-        try:
-            code = maybe_run_go_register_from_python(SITE_KEY, ACTION_ID, STATE_TREE)
-            return 0 if code is None else int(code)
-        finally:
-            try:
-                _stop_managed_turnstile_solver()
-                log("[*] 协议注册结束：已停止 Turnstile solver 进程组")
-            except Exception as exc:
-                debug_log(f"stop solver after protocol: {exc}")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(executable_path=find_chrome(), headless=True)

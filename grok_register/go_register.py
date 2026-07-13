@@ -112,10 +112,12 @@ def maybe_run_go_register_from_python(site_key: str, action_id: str, state_tree:
             from grok_register import job_store
             import time as _t
 
+            # Keep pid from dashboard spawn so UI can still show last process
             job_store.write_register_job(
                 running=False,
                 finished_at=_t.time(),
                 message=f"python-protocol exit={code}",
+                success=0,
             )
         except Exception:
             pass

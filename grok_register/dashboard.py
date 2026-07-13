@@ -482,6 +482,19 @@ def _accounts_overview_block() -> dict:
         return {"count": _accounts_count(), "error": str(exc)}
 
 
+def _tail_log(path: Path, *, max_bytes: int = 2500) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+    text = data.decode("utf-8", errors="replace").strip()
+    # keep last ~12 non-empty lines for UI
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return "\n".join(lines[-12:])
+
+
 def _spawn_register(args: list[str] | None = None, *, engine: str | None = None) -> dict:
     if process_alive():
         return {"ok": False, "message": "register already running"}
@@ -492,10 +505,14 @@ def _spawn_register(args: list[str] | None = None, *, engine: str | None = None)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     eng = (engine or env.get("REGISTER_ENGINE") or "protocol").strip().lower()
-    if eng in {"protocol", "http", "go"}:
-        env["REGISTER_ENGINE"] = eng if eng != "http" else "protocol"
+    if eng in {"protocol", "http", "python", "go"}:
+        env["REGISTER_ENGINE"] = "protocol" if eng == "http" else eng
     # detach — browser only displays progress via runtime-status + register-job.json
     with open(log_path, "ab", buffering=0) as logf:
+        logf.write(
+            f"\n===== spawn {time.strftime('%Y-%m-%dT%H:%M:%S')} engine={env.get('REGISTER_ENGINE')} "
+            f"cmd={' '.join(cmd)} =====\n".encode()
+        )
         proc = subprocess.Popen(
             cmd,
             cwd=str(PROJECT_ROOT),
@@ -511,6 +528,34 @@ def _spawn_register(args: list[str] | None = None, *, engine: str | None = None)
         os.kill(proc.pid, signal.SIGCONT)
     except Exception:
         pass
+    # Detect instant crash (missing deps / config) so panel does not show "running" then offline
+    time.sleep(0.85)
+    early_code = proc.poll()
+    if early_code is not None:
+        tail = _tail_log(log_path)
+        msg = (
+            f"注册进程秒退 exit={early_code} engine={env.get('REGISTER_ENGINE')}。"
+            f" 见 logs/register-dashboard.log"
+        )
+        job_store.write_register_job(
+            running=False,
+            engine=env.get("REGISTER_ENGINE") or "protocol",
+            pid=proc.pid,
+            started_at=time.time(),
+            finished_at=time.time(),
+            message=msg,
+            error=tail[:500],
+            log=str(log_path),
+        )
+        return {
+            "ok": False,
+            "message": msg + (f"\n--- log ---\n{tail}" if tail else ""),
+            "pid": proc.pid,
+            "exit_code": early_code,
+            "log": str(log_path),
+            "log_tail": tail,
+            "engine": env.get("REGISTER_ENGINE") or "protocol",
+        }
     try:
         from grok_register.runtime_status import write_pid
 
@@ -527,7 +572,7 @@ def _spawn_register(args: list[str] | None = None, *, engine: str | None = None)
                     pass
     job_store.write_register_job(
         running=True,
-        engine=env.get("REGISTER_ENGINE") or "python",
+        engine=env.get("REGISTER_ENGINE") or "protocol",
         pid=proc.pid,
         started_at=time.time(),
         finished_at=0,
@@ -548,7 +593,7 @@ def _spawn_register(args: list[str] | None = None, *, engine: str | None = None)
         ),
         "pid": proc.pid,
         "log": str(log_path),
-        "engine": env.get("REGISTER_ENGINE") or "python",
+        "engine": env.get("REGISTER_ENGINE") or "protocol",
     }
 
 
@@ -982,8 +1027,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </label>
           <label><span data-i18n="reg_engine_pick">引擎</span>
             <select id="reg-engine" style="background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 8px">
-              <option value="python">Python</option>
-              <option value="go">Go</option>
+              <option value="protocol" selected>协议 HTTP（推荐）</option>
+              <option value="python">浏览器 Python</option>
+              <option value="go">Go worker</option>
             </select>
           </label>
         </div>
@@ -1237,8 +1283,9 @@ const I18N = {
     cpa_sync_hint: "仅导入单账号 xai-*.json（type=xai）。不使用任何合并包。",
     cpa_sync_running: "CLIProxyAPI 同步中…",
     cpa_sync_done: "CLIProxyAPI 同步完成",
-    btn_start: "启动注册",
-    btn_start_py: "启动 Python 注册",
+    btn_start: "启动协议注册",
+    btn_start_py: "启动浏览器注册",
+    btn_start_browser: "启动浏览器注册",
     btn_start_go: "启动 Go 注册",
     btn_stop: "停止注册",
     btn_scrape: "爬取代理",
@@ -1410,8 +1457,9 @@ const I18N = {
     cpa_sync_hint: "Imports single xai-*.json only (type=xai). No merge bundle.",
     cpa_sync_running: "CLIProxyAPI sync running…",
     cpa_sync_done: "CLIProxyAPI sync done",
-    btn_start: "Start register",
-    btn_start_py: "Start Python",
+    btn_start: "Start protocol register",
+    btn_start_py: "Start browser register",
+    btn_start_browser: "Start browser register",
     btn_start_go: "Start Go",
     btn_stop: "Stop register",
     btn_scrape: "Scrape proxies",
@@ -1830,7 +1878,8 @@ async function refreshStatus(fromCache){
   // engine select default from server
   const engSel=$("reg-engine");
   if(engSel && !engSel.dataset.touched){
-    engSel.value = (data.engines?.register==="go") ? "go" : "python";
+    const re = (data.engines?.register || data.config?.REGISTER_ENGINE || "protocol")+"";
+    engSel.value = ["protocol","python","go"].includes(re) ? re : "protocol";
   }
   const tgt=$("reg-target");
   if(tgt && !tgt.dataset.touched){
@@ -1848,7 +1897,7 @@ async function refreshStatus(fromCache){
       try{
         const body=Object.assign({action}, payload||{});
         if(action==="start"){
-          body.engine = ($("reg-engine")?.value)||body.engine||"python";
+          body.engine = ($("reg-engine")?.value)||body.engine||"protocol";
           const tval = ($("reg-target")?.value||"").trim();
           if(tval!==""){
             body.target = tval;
@@ -1856,7 +1905,9 @@ async function refreshStatus(fromCache){
           }
         }
         const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-        $("action-note").textContent=r.message||JSON.stringify(r);
+        let note = r.message||JSON.stringify(r);
+        if(r.log_tail) note += "\n"+r.log_tail;
+        $("action-note").textContent=note;
         await refreshStatus();
         if(action==="rebuild_bundles") loadAccounts();
       }catch(e){$("action-note").textContent=String(e)}
@@ -1864,8 +1915,8 @@ async function refreshStatus(fromCache){
     };
     return b;
   };
-  actions.append(mk(t("btn_start"),"start","primary",{engine:"python"}));
-  actions.append(mk(t("btn_start_go"),"start","",{engine:"go"}));
+  actions.append(mk(t("btn_start"),"start","primary",{engine:"protocol"}));
+  actions.append(mk(t("btn_start_browser"),"start","",{engine:"python"}));
   actions.append(mk(t("btn_stop"),"stop","danger"));
   actions.append(mk(t("btn_refresh"),"refresh","","",true));
   actions.append(mk(t("btn_scrape"),"scrape"));
