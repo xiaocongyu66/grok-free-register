@@ -41,6 +41,7 @@ class HTTPProbeExecutor:
 
 class PlaywrightExecutor:
     ALLOWED_CONTROLS = frozenset({"Authorize", "Allow", "Continue", "Confirm"})
+    ATTEMPT_TIMEOUT_SECONDS = 75.0
     CLOSE_TIMEOUT_SECONDS = 5.0
 
     def __init__(self, concurrency=1, playwright_factory=None, executable_path=None):
@@ -85,10 +86,7 @@ class PlaywrightExecutor:
             try:
                 browser = await playwright.chromium.launch(**options)
             except BaseException:
-                with suppress(Exception):
-                    await asyncio.wait_for(
-                        playwright.stop(), timeout=self.CLOSE_TIMEOUT_SECONDS
-                    )
+                await self._close_transport_resource(playwright.stop())
                 raise
             self._playwright = playwright
             self._browser = browser
@@ -104,14 +102,38 @@ class PlaywrightExecutor:
         self._playwright = None
         try:
             if browser is not None:
-                await asyncio.wait_for(
-                    browser.close(), timeout=self.CLOSE_TIMEOUT_SECONDS
-                )
+                await self._close_transport_resource(browser.close())
         finally:
             if playwright is not None:
-                await asyncio.wait_for(
-                    playwright.stop(), timeout=self.CLOSE_TIMEOUT_SECONDS
-                )
+                await self._close_transport_resource(playwright.stop())
+
+    @staticmethod
+    def _consume_task_result(task):
+        with suppress(BaseException):
+            task.result()
+
+    @classmethod
+    async def _close_transport_resource(cls, awaitable):
+        task = asyncio.create_task(awaitable)
+        try:
+            done, _pending = await asyncio.wait(
+                {task}, timeout=cls.CLOSE_TIMEOUT_SECONDS
+            )
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(cls._consume_task_result)
+            raise
+        if task in done:
+            cls._consume_task_result(task)
+            return True
+        task.cancel()
+        task.add_done_callback(cls._consume_task_result)
+        return False
+
+    async def _recycle_browser(self, browser):
+        async with self._lifecycle_lock:
+            if self._browser is browser:
+                await self._close_unlocked()
 
     async def __aenter__(self):
         await self.start()
@@ -131,10 +153,6 @@ class PlaywrightExecutor:
             if closers:
                 await asyncio.gather(*closers, return_exceptions=True)
 
-        def consume_result(task):
-            with suppress(BaseException):
-                task.result()
-
         cleanup = asyncio.create_task(close_session())
         cancelled = False
         deadline = asyncio.get_running_loop().time() + cls.CLOSE_TIMEOUT_SECONDS
@@ -147,14 +165,14 @@ class PlaywrightExecutor:
             except asyncio.CancelledError:
                 cancelled = True
         if cleanup.done():
-            consume_result(cleanup)
+            cls._consume_task_result(cleanup)
         else:
             # asyncio.wait_for() is not a hard deadline: it cancels the child and
             # then waits for cancellation to finish, which a wedged Playwright
             # transport may never do.  Abandon the cleanup task after one real
             # wall-clock deadline and consume its eventual result asynchronously.
             cleanup.cancel()
-            cleanup.add_done_callback(consume_result)
+            cleanup.add_done_callback(cls._consume_task_result)
         if cancelled:
             raise asyncio.CancelledError
         return cleanup.done()
@@ -255,13 +273,40 @@ class PlaywrightExecutor:
     async def confirm(self, source: SourceRecord, flow: DeviceFlow):
         await self.start()
         async with self._semaphore:
-            context = None
-            page = None
-            code_submitted = False
-            consent_submitted = False
-            challenge_clicks = 0
+            browser = self._browser
+            attempt = asyncio.create_task(
+                self._confirm_once(browser, source, flow)
+            )
             try:
-                context = await self._browser.new_context()
+                done, _pending = await asyncio.wait(
+                    {attempt}, timeout=self.ATTEMPT_TIMEOUT_SECONDS
+                )
+            except asyncio.CancelledError:
+                attempt.cancel()
+                attempt.add_done_callback(self._consume_task_result)
+                raise
+            if attempt in done:
+                return attempt.result()
+
+            # A Playwright transport can swallow cancellation while one of its
+            # RPCs is wedged.  Do not let asyncio.wait_for() extend the nominal
+            # timeout indefinitely: detach the attempt and replace the complete
+            # browser transport before admitting the next account.
+            attempt.cancel()
+            attempt.add_done_callback(self._consume_task_result)
+            await self._recycle_browser(browser)
+            return AuthorizationResult(
+                AuthorizationStatus.NEEDS_INTERACTION, "confirmation_timeout"
+            )
+
+    async def _confirm_once(self, browser, source: SourceRecord, flow: DeviceFlow):
+        context = None
+        page = None
+        code_submitted = False
+        consent_submitted = False
+        challenge_clicks = 0
+        try:
+                context = await browser.new_context()
                 page = await context.new_page()
                 await context.add_cookies(self._expanded_cookies(source))
                 await page.goto(flow.verification_url, wait_until="domcontentloaded")
@@ -479,16 +524,16 @@ class PlaywrightExecutor:
                 return AuthorizationResult(
                     AuthorizationStatus.NEEDS_INTERACTION, "confirmation_timeout"
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                is_timeout = (
-                    error.__class__.__name__ == "TimeoutError"
-                    and error.__class__.__module__.startswith("playwright")
-                )
-                return AuthorizationResult(
-                    AuthorizationStatus.NEEDS_INTERACTION,
-                    "confirmation_timeout" if is_timeout else "browser_error",
-                )
-            finally:
-                await self._close_attempt_resources(page, context)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            is_timeout = (
+                error.__class__.__name__ == "TimeoutError"
+                and error.__class__.__module__.startswith("playwright")
+            )
+            return AuthorizationResult(
+                AuthorizationStatus.NEEDS_INTERACTION,
+                "confirmation_timeout" if is_timeout else "browser_error",
+            )
+        finally:
+            await self._close_attempt_resources(page, context)

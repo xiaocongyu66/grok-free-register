@@ -312,3 +312,100 @@ def test_playwright_attempt_cleanup_has_a_true_wall_clock_deadline(monkeypatch):
         assert completed_within_deadline
 
     asyncio.run(scenario())
+
+
+def test_playwright_confirmation_has_hard_deadline_and_restarts_browser(monkeypatch):
+    class StubbornGotoPage(FakePage):
+        def __init__(self):
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def goto(self, url, wait_until):
+            self.url = url
+            self.entered.set()
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    # Model a wedged Playwright transport that does not finish
+                    # propagating task cancellation.
+                    continue
+
+    class StubbornGotoContext(FakeContext):
+        def __init__(self):
+            super().__init__()
+            self.page = StubbornGotoPage()
+
+    class StubbornGotoBrowser(FakeBrowser):
+        def __init__(self):
+            super().__init__()
+            self.close_entered = asyncio.Event()
+            self.close_release = asyncio.Event()
+
+        async def new_context(self):
+            context = StubbornGotoContext()
+            self.contexts.append(context)
+            return context
+
+        async def close(self):
+            self.close_entered.set()
+            while not self.close_release.is_set():
+                try:
+                    await self.close_release.wait()
+                except asyncio.CancelledError:
+                    continue
+            self.closed = True
+
+    class RotatingPlaywrightFactory:
+        def __init__(self):
+            self.browsers = [StubbornGotoBrowser(), FakeBrowser()]
+            self.playwrights = [FakePlaywright(browser) for browser in self.browsers]
+            self.starts = 0
+
+        def __call__(self):
+            factory = self
+
+            class Runner:
+                async def start(self):
+                    playwright = factory.playwrights[factory.starts]
+                    factory.starts += 1
+                    return playwright
+
+            return Runner()
+
+    async def scenario():
+        monkeypatch.setattr(PlaywrightExecutor, "ATTEMPT_TIMEOUT_SECONDS", 0.02)
+        monkeypatch.setattr(PlaywrightExecutor, "CLOSE_TIMEOUT_SECONDS", 0.02)
+        factory = RotatingPlaywrightFactory()
+        executor = PlaywrightExecutor(playwright_factory=factory)
+        source = SourceRecord("source", "secret-token")
+        flow = DeviceFlow(
+            "device", "ABCD", "https://accounts.x.ai/oauth2/device", 60, 1
+        )
+
+        first = asyncio.create_task(executor.confirm(source, flow))
+        while not factory.browsers[0].contexts:
+            await asyncio.sleep(0)
+        stuck_page = factory.browsers[0].contexts[0].page
+        await stuck_page.entered.wait()
+        done, _pending = await asyncio.wait({first}, timeout=0.10)
+        completed_within_deadline = first in done
+
+        stuck_page.release.set()
+        factory.browsers[0].close_release.set()
+        first_result = await first
+        await asyncio.sleep(0)
+        second_result = await executor.confirm(source, flow)
+        await executor.close()
+
+        assert completed_within_deadline
+        assert first_result.status is AuthorizationStatus.NEEDS_INTERACTION
+        assert first_result.reason_code == "confirmation_timeout"
+        assert second_result.status is AuthorizationStatus.AUTHORIZED
+        assert factory.starts == 2
+        assert factory.browsers[0].close_entered.is_set()
+        assert factory.browsers[0].closed
+        assert factory.playwrights[0].stopped
+
+    asyncio.run(scenario())
