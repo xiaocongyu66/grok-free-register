@@ -765,7 +765,7 @@ func setTargetSSO(targets []AccountRecord, em, sso string) {
 func scanAccounts(root string) []AccountRecord {
 	byEmail := map[string]*AccountRecord{}
 
-	// legacy accounts.txt  email:password:sso
+	// accounts.txt  email:password (or legacy email:password:sso)
 	accountsTxt := filepath.Join(root, "accounts.txt")
 	if b, err := os.ReadFile(accountsTxt); err == nil {
 		mt := mtimeISO(accountsTxt)
@@ -815,6 +815,43 @@ func scanAccounts(root string) []AccountRecord {
 				rec.Status = "legacy_sso"
 			} else if sso != "" && rec.Status == "" {
 				rec.Status = "legacy_sso"
+			}
+		}
+	}
+
+	// keys/sso.txt — canonical email:sso
+	ssoTxt := filepath.Join(root, "sso.txt")
+	if b, err := os.ReadFile(ssoTxt); err == nil {
+		mt := mtimeISO(ssoTxt)
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			email, sso, ok := strings.Cut(line, ":")
+			email = strings.TrimSpace(email)
+			sso = normalizeSSOToken(sso)
+			if !ok || email == "" || !strings.Contains(email, "@") || sso == "" {
+				continue
+			}
+			rec := ensureRec(byEmail, email)
+			if !hasFmt(rec, "sso") {
+				rec.Formats = append(rec.Formats, "sso")
+			}
+			rec.HasSSO = true
+			rec.SSO = sso
+			if rec.Paths == nil {
+				rec.Paths = map[string]string{}
+			}
+			rec.Paths["sso"] = ssoTxt
+			if rec.UpdatedAt == "" || rec.Source == "accounts.txt" {
+				rec.UpdatedAt = mt
+			}
+			if rec.Source == "" || rec.Source == "accounts.txt" {
+				rec.Source = "sso.txt"
+			}
+			if rec.Status == "unknown" || rec.Status == "legacy_sso" || rec.Status == "" {
+				rec.Status = "oauth_pending"
 			}
 		}
 	}
@@ -961,7 +998,7 @@ func scanAccounts(root string) []AccountRecord {
 	out := make([]AccountRecord, 0, len(byEmail))
 	for _, rec := range byEmail {
 		if rec.HasSSO && !rec.HasAccessToken && !rec.HasRefreshToken &&
-			hasFmt(rec, "legacy") && !hasFmt(rec, "sub2api") && !hasFmt(rec, "cpa") {
+			!hasFmt(rec, "sub2api") && !hasFmt(rec, "cpa") {
 			rec.Status = "oauth_pending"
 		}
 		if len(rec.Formats) == 0 {

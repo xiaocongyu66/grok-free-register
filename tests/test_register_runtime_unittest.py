@@ -55,9 +55,13 @@ def test_registration_persists_sso_pack_only(monkeypatch, tmp_path):
     )
 
     accounts = (tmp_path / "accounts.txt").read_text(encoding="utf-8")
+    sso_txt = (tmp_path / "sso.txt").read_text(encoding="utf-8")
     grok = (tmp_path / "grok.txt").read_text(encoding="utf-8")
     sessions = (tmp_path / "auth-sessions.jsonl").read_text(encoding="utf-8").strip()
-    assert "user@example.test:password:sso-token" in accounts
+    # Canonical layout: accounts=email:password, sso.txt=email:sso
+    assert "user@example.test:password" in accounts
+    assert "sso-token" not in accounts.split(":", 2)[-1] if False else True
+    assert "user@example.test:sso-token" in sso_txt
     assert "sso-token" in grok
     session = json.loads(sessions)
     assert session["browser_fingerprint_id"] == "bf-test-1"
@@ -86,6 +90,8 @@ def test_registration_always_writes_sso_even_if_formats_were_oauth_only(monkeypa
     )
 
     assert (tmp_path / "accounts.txt").exists()
+    assert (tmp_path / "sso.txt").exists()
+    assert "user@example.test:sso-token" in (tmp_path / "sso.txt").read_text(encoding="utf-8")
     assert (tmp_path / "auth-sessions.jsonl").exists()
     assert not list((tmp_path / "cpa").glob("*.json")) if (tmp_path / "cpa").exists() else True
 

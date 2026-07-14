@@ -112,7 +112,7 @@ def scan_accounts(root: Path | None = None) -> list[AccountRecord]:
     by_email: dict[str, AccountRecord] = {}
     inv_map, job_map = _load_ledger_maps(root)
 
-    # legacy accounts.txt
+    # accounts.txt — email:password (or legacy email:password:sso)
     accounts_txt = root / "accounts.txt"
     if accounts_txt.is_file():
         try:
@@ -140,6 +140,38 @@ def scan_accounts(root: Path | None = None) -> list[AccountRecord]:
                 rec.source = rec.source or "accounts.txt"
                 if sso and rec.status == "unknown":
                     rec.status = "legacy_sso"
+                by_email[email] = rec
+        except OSError:
+            pass
+
+    # keys/sso.txt — canonical email:sso
+    sso_txt = root / "sso.txt"
+    if sso_txt.is_file():
+        try:
+            for line in sso_txt.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or ":" not in line:
+                    continue
+                email, sso = line.split(":", 1)
+                email, sso = email.strip(), sso.strip()
+                if not email or "@" not in email or not sso:
+                    continue
+                rec = by_email.get(email) or AccountRecord(
+                    id=email,
+                    email=email,
+                    status="oauth_pending",
+                    formats=[],
+                )
+                if "sso" not in rec.formats:
+                    rec.formats.append("sso")
+                rec.has_sso = True
+                rec.paths = rec.paths or {}
+                rec.paths["sso"] = str(sso_txt)
+                rec.updated_at = max(rec.updated_at or "", _mtime_iso(sso_txt))
+                if rec.source in {"", "accounts.txt"}:
+                    rec.source = "sso.txt"
+                if rec.status in {"unknown", "legacy_sso", ""}:
+                    rec.status = "oauth_pending"
                 by_email[email] = rec
         except OSError:
             pass
@@ -217,10 +249,10 @@ def scan_accounts(root: Path | None = None) -> list[AccountRecord]:
                 rec.ledger_state = inv_map[fp]
             by_email[email] = rec
 
-    # derive oauth_pending: has legacy sso but no oauth formats
+    # derive oauth_pending: has SSO (sso.txt or legacy) but no OAuth product
     for rec in by_email.values():
         if rec.has_sso and not (rec.has_access_token or rec.has_refresh_token):
-            if "legacy" in rec.formats and "sub2api" not in rec.formats and "cpa" not in rec.formats:
+            if "sub2api" not in rec.formats and "cpa" not in rec.formats:
                 rec.status = "oauth_pending"
         if not rec.formats:
             rec.formats = ["unknown"]
@@ -386,14 +418,21 @@ RECOVERY_FILE_SPECS: list[dict[str, str]] = [
         "name": "accounts.txt",
         "media": "text/plain; charset=utf-8",
         "aliases": "legacy,accounts,txt,accounts_txt,accounts.txt",
-        "desc": "email:password:sso 主台账",
+        "desc": "email:password 账密（重登用）",
+    },
+    {
+        "id": "sso_txt",
+        "name": "sso.txt",
+        "media": "text/plain; charset=utf-8",
+        "aliases": "sso,sso_txt,sso.txt,sso_file",
+        "desc": "规范 SSO：email:sso（convert 源）",
     },
     {
         "id": "auth_sessions",
         "name": "auth-sessions.jsonl",
         "media": "application/x-ndjson; charset=utf-8",
         "aliases": "auth_sessions,sessions,auth-sessions,auth-sessions.jsonl,jsonl",
-        "desc": "SSO cookie / 会话（enroller 用）",
+        "desc": "SSO cookie / 会话备份",
     },
     {
         "id": "browser_fingerprints",
@@ -406,8 +445,8 @@ RECOVERY_FILE_SPECS: list[dict[str, str]] = [
         "id": "grok_txt",
         "name": "grok.txt",
         "media": "text/plain; charset=utf-8",
-        "aliases": "grok,grok_txt,grok.txt,sso",
-        "desc": "纯 SSO 行（一行一个）",
+        "aliases": "grok,grok_txt,grok.txt",
+        "desc": "纯 SSO token 列表（由 sso.txt 生成）",
     },
     {
         "id": "protocol_log",
